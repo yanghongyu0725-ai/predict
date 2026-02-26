@@ -5,6 +5,7 @@ import argparse
 import json
 import math
 import os
+import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -14,6 +15,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import ccxt
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 from sklearn.preprocessing import StandardScaler
 from tensorflow.keras import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
@@ -134,12 +136,7 @@ def load_features(ex: ccxt.binance, symbol: str) -> Tuple[pd.DataFrame, pd.DataF
         return pd.DataFrame(), pd.DataFrame()
 
     feat4 = pd.concat([h4, d1.reindex(h4.index, method="ffill"), w1.reindex(h4.index, method="ffill")], axis=1).dropna()
-    feat15 = pd.concat([
-        m15,
-        h4.reindex(m15.index, method="ffill"),
-        d1.reindex(m15.index, method="ffill"),
-        w1.reindex(m15.index, method="ffill"),
-    ], axis=1).dropna()
+    feat15 = pd.concat([m15, h4.reindex(m15.index, method="ffill"), d1.reindex(m15.index, method="ffill"), w1.reindex(m15.index, method="ffill")], axis=1).dropna()
     return feat4, feat15
 
 
@@ -233,7 +230,6 @@ def signal_lstm_confluence(row: pd.Series) -> int:
 
 
 def evaluate_strategy(data: pd.DataFrame, signal_fn: Callable[[pd.Series], int], horizon: int, risk_reward: float, stop_atr_mult: float) -> Dict[str, float]:
-    # 验证口径：不考虑停机、熔断、手续费、滑点
     rets = []
     for i in range(len(data) - horizon):
         row = data.iloc[i]
@@ -292,6 +288,16 @@ def latest_15m_trigger(feat15: pd.DataFrame, direction: int, lookback: int = 300
     return str(hit.index[-1]), float(hit.iloc[-1]["m15_Close"])
 
 
+def create_chart(feat15: pd.DataFrame, output_path: Path, symbol: str) -> None:
+    d = feat15.tail(400)
+    fig = go.Figure(data=[go.Candlestick(x=d.index, open=d["m15_Open"], high=d["m15_High"], low=d["m15_Low"], close=d["m15_Close"], name="15m")])
+    fig.add_trace(go.Scatter(x=d.index, y=d["m15_ema20"], name="EMA20"))
+    fig.add_trace(go.Scatter(x=d.index, y=d["m15_ema50"], name="EMA50"))
+    fig.update_layout(title=f"{symbol} 15m K线", template="plotly_dark", xaxis_rangeslider_visible=False)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_html(str(output_path), include_plotlyjs="cdn")
+
+
 def append_jsonl(path: Path, payload: Dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
@@ -303,7 +309,7 @@ def safe_api_call(fn: Callable, cfg: EngineConfig):
     for _ in range(cfg.max_retries):
         try:
             return fn()
-        except Exception as e:  # noqa
+        except Exception as e:
             last_err = e
             time.sleep(cfg.retry_delay_seconds)
     raise RuntimeError(f"API调用失败(重试{cfg.max_retries}次): {last_err}")
@@ -332,13 +338,7 @@ def calculate_order_qty_with_exchange_rules(ex: ccxt.binance, symbol: str, entry
 
 
 def place_order_industrial(plan: Dict[str, float | str], params: StrategyParams, args: argparse.Namespace, cfg: EngineConfig) -> Dict:
-    state = {
-        "timestamp": datetime.utcnow().isoformat(),
-        "state": "SKIPPED",
-        "reason": "",
-        "order_id": None,
-        "protective": {},
-    }
+    state = {"timestamp": datetime.utcnow().isoformat(), "state": "SKIPPED", "reason": "", "order_id": None, "protective": {}}
     if not args.auto_trade:
         state["reason"] = "auto_trade_disabled"
         return state
@@ -362,55 +362,48 @@ def place_order_industrial(plan: Dict[str, float | str], params: StrategyParams,
     entry = float(plan["entry"])
     stop_loss = float(plan["stop_loss"])
     take_profit = float(plan["take_profit"])
-
     qty = calculate_order_qty_with_exchange_rules(ex, params.symbol, entry, stop_loss, params.max_risk_per_trade, usdt_free)
 
     side = "buy" if plan["direction"] == "做多" else "sell"
     order_type = args.order_type
-    main_order = safe_api_call(
-        lambda: ex.create_order(params.symbol, order_type, side, qty, None if order_type == "market" else entry),
-        cfg,
-    )
+    main_order = safe_api_call(lambda: ex.create_order(params.symbol, order_type, side, qty, None if order_type == "market" else entry), cfg)
 
     state["state"] = "MAIN_ORDER_FILLED_OR_ACCEPTED"
     state["order_id"] = main_order.get("id")
     state["main_order"] = main_order
+    state["position"] = {"symbol": params.symbol, "side": side, "qty": qty, "entry": entry}
 
-    # 参考工业流程：尝试创建保护单（若交易所/账户不支持则记录失败，不中断主流程）
     reduce_side = "sell" if side == "buy" else "buy"
     try:
-        sl_order = safe_api_call(
-            lambda: ex.create_order(
-                params.symbol,
-                "stop_market",
-                reduce_side,
-                qty,
-                None,
-                {"stopPrice": stop_loss, "reduceOnly": True},
-            ),
-            cfg,
-        )
+        sl_order = safe_api_call(lambda: ex.create_order(params.symbol, "stop_market", reduce_side, qty, None, {"stopPrice": stop_loss, "reduceOnly": True}), cfg)
         state["protective"]["stop_loss"] = {"status": "ok", "order": sl_order}
-    except Exception as e:  # noqa
+    except Exception as e:
         state["protective"]["stop_loss"] = {"status": "failed", "error": str(e)}
 
     try:
-        tp_order = safe_api_call(
-            lambda: ex.create_order(
-                params.symbol,
-                "take_profit_market",
-                reduce_side,
-                qty,
-                None,
-                {"stopPrice": take_profit, "reduceOnly": True},
-            ),
-            cfg,
-        )
+        tp_order = safe_api_call(lambda: ex.create_order(params.symbol, "take_profit_market", reduce_side, qty, None, {"stopPrice": take_profit, "reduceOnly": True}), cfg)
         state["protective"]["take_profit"] = {"status": "ok", "order": tp_order}
-    except Exception as e:  # noqa
+    except Exception as e:
         state["protective"]["take_profit"] = {"status": "failed", "error": str(e)}
 
     return state
+
+
+def select_best_strategy(results: Dict[str, Dict[str, float]], latest_row: pd.Series) -> Tuple[str, int]:
+    positive = {k: v for k, v in results.items() if v["return_rate"] > 0}
+    if not positive:
+        return "禁用(全部策略历史收益<=0)", 0
+    best_name = max(positive.keys(), key=lambda n: positive[n]["return_rate"])
+    signal_map: Dict[str, Callable[[pd.Series], int]] = {
+        "EMA单指标": lambda r: signal_ema(r, "h4"),
+        "RSI单指标": lambda r: signal_rsi(r, "h4"),
+        "MACD单指标": lambda r: signal_macd(r, "h4"),
+        "ADX趋势": lambda r: signal_adx_trend(r, "h4"),
+        "量能OBV": lambda r: signal_volume_obv(r, "h4"),
+        "多指标共振": signal_multi_confluence,
+        "LSTM+多指标共振": signal_lstm_confluence,
+    }
+    return best_name, signal_map[best_name](latest_row)
 
 
 def run_once(args: argparse.Namespace, params: StrategyParams, cfg: EngineConfig) -> Dict:
@@ -445,8 +438,9 @@ def run_once(args: argparse.Namespace, params: StrategyParams, cfg: EngineConfig
     results = {name: evaluate_strategy(eval_df, fn, params.predict_horizon, params.risk_reward, params.stop_atr_mult) for name, fn in strategies.items()}
 
     latest = eval_df.iloc[-1]
-    sig = signal_lstm_confluence(latest)
+    best_strategy_name, sig = select_best_strategy(results, latest)
     direction = "做多" if sig == 1 else "做空" if sig == -1 else "空仓"
+
     entry = float(latest["h4_Close"])
     stop_dist = max(float(latest["h4_atr14"]) * params.stop_atr_mult, entry * 0.005)
     sl = entry - stop_dist if sig == 1 else entry + stop_dist if sig == -1 else float("nan")
@@ -456,6 +450,7 @@ def run_once(args: argparse.Namespace, params: StrategyParams, cfg: EngineConfig
     plan = {
         "timestamp": datetime.utcnow().isoformat(),
         "symbol": params.symbol,
+        "selected_strategy": best_strategy_name,
         "model_prob_up": float(latest["model_prob"]),
         "direction": direction,
         "signal_time_4h": str(eval_df.index[-1]),
@@ -468,46 +463,94 @@ def run_once(args: argparse.Namespace, params: StrategyParams, cfg: EngineConfig
     }
 
     execution = place_order_industrial(plan, params, args, cfg)
-    payload = {"plan": plan, "strategies": results, "execution": execution}
+
+    chart_path = Path(cfg.output_dir) / "chart_15m.html"
+    create_chart(feat15, chart_path, params.symbol)
+
+    payload = {"plan": plan, "strategies": results, "execution": execution, "chart": str(chart_path)}
     return payload
+
+
+
+
+def write_history_sqlite(payload: Dict, cfg: EngineConfig) -> None:
+    db = Path(cfg.output_dir) / "history.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(db)
+    try:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS signal_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                strategy TEXT,
+                direction TEXT,
+                model_prob_up REAL,
+                entry REAL,
+                stop_loss REAL,
+                take_profit REAL,
+                risk_reward REAL,
+                trigger_time_15m TEXT,
+                raw_json TEXT NOT NULL
+            )
+            """
+        )
+        plan = payload.get("plan", {})
+        con.execute(
+            """
+            INSERT INTO signal_history (
+                ts, symbol, strategy, direction, model_prob_up, entry, stop_loss, take_profit,
+                risk_reward, trigger_time_15m, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                plan.get("timestamp"),
+                plan.get("symbol"),
+                plan.get("selected_strategy"),
+                plan.get("direction"),
+                plan.get("model_prob_up"),
+                plan.get("entry"),
+                plan.get("stop_loss"),
+                plan.get("take_profit"),
+                plan.get("risk_reward"),
+                plan.get("trigger_time_15m"),
+                json.dumps(payload, ensure_ascii=False),
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
 
 
 def write_runtime_files(payload: Dict, cfg: EngineConfig) -> None:
     out_dir = Path(cfg.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    latest_file = out_dir / "latest_signal.json"
-    history_file = out_dir / "signal_history.jsonl"
-    stats_file = out_dir / "strategy_metrics_latest.json"
-
-    latest_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    stats_file.write_text(json.dumps(payload.get("strategies", {}), ensure_ascii=False, indent=2), encoding="utf-8")
-    append_jsonl(history_file, payload)
+    (out_dir / "latest_signal.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / "strategy_metrics_latest.json").write_text(json.dumps(payload.get("strategies", {}), ensure_ascii=False, indent=2), encoding="utf-8")
+    append_jsonl(out_dir / "signal_history.jsonl", payload)
+    write_history_sqlite(payload, cfg)
 
 
 def run_daemon(args: argparse.Namespace, params: StrategyParams, cfg: EngineConfig) -> None:
-    print(f"后台模式启动: 每 {args.interval_minutes} 分钟运行一次, 持续验证多指标胜率/盈亏率")
     next_heartbeat = time.time()
     while True:
         now = time.time()
         if now >= next_heartbeat:
-            hb = {"timestamp": datetime.utcnow().isoformat(), "status": "alive"}
-            append_jsonl(Path(cfg.output_dir) / "heartbeat.jsonl", hb)
+            append_jsonl(Path(cfg.output_dir) / "heartbeat.jsonl", {"timestamp": datetime.utcnow().isoformat(), "status": "alive"})
             next_heartbeat = now + cfg.heartbeat_seconds
-
         try:
             payload = run_once(args, params, cfg)
             write_runtime_files(payload, cfg)
-            print(f"[{datetime.now().isoformat()}] 已更新: 信号 + 多策略统计")
+            print(f"[{datetime.now().isoformat()}] 更新完成")
         except Exception as e:
-            err = {"timestamp": datetime.utcnow().isoformat(), "error": str(e)}
-            append_jsonl(Path(cfg.output_dir) / "errors.jsonl", err)
+            append_jsonl(Path(cfg.output_dir) / "errors.jsonl", {"timestamp": datetime.utcnow().isoformat(), "error": str(e)})
             print(f"运行失败: {e}")
-
         time.sleep(max(60, args.interval_minutes * 60))
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Binance 多策略 + LSTM（工业级流程参考版）")
+    p = argparse.ArgumentParser(description="Binance 多策略 + LSTM 引擎")
     p.add_argument("--symbol", default="BTC/USDT")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--risk_reward", type=float, default=1.6)
@@ -526,11 +569,9 @@ def main() -> None:
     args = parse_args()
     params = StrategyParams(symbol=args.symbol, risk_reward=max(args.risk_reward, 1.2), max_risk_per_trade=0.05)
     cfg = EngineConfig(output_dir=args.output_dir, heartbeat_seconds=args.heartbeat_seconds, max_retries=args.max_retries)
-
     if args.daemon:
         run_daemon(args, params, cfg)
         return
-
     payload = run_once(args, params, cfg)
     write_runtime_files(payload, cfg)
     print(json.dumps(payload, ensure_ascii=False, indent=2))

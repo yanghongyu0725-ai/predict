@@ -66,11 +66,45 @@ nohup python crypto_deep_strategy.py --symbol BTC/USDT --daemon --interval_minut
 
 ## 缺少环境怎么办
 
-如果你运行时报 `ModuleNotFoundError`（例如缺少 `ccxt` / `tensorflow`），按下面做：
+如果你运行时报 `ModuleNotFoundError`（例如缺少 `ccxt` / `tensorflow`），按你所在系统执行：
+
+### Windows CMD
+
+> 先确认在项目根目录（能看到 `crypto_deep_strategy.py` 和 `scripts` 文件夹）。
+
+```bat
+dir
+setup_env.bat
+call .venv\Scripts\activate.bat
+python scripts/check_env.py
+```
+
+如果仍报“不是内部或外部命令”，请先：
+
+```bat
+git pull
+dir scripts
+```
+
+并尝试显式路径：
+
+```bat
+.\scripts\setup_env.bat
+```
+
+### Windows PowerShell
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup_env.ps1
+.\.venv\Scripts\Activate.ps1
+python scripts/check_env.py
+```
+
+### Linux / macOS / Git-Bash
 
 ```bash
 bash scripts/setup_env.sh
-source .venv/bin/activate
+. .venv/bin/activate
 python scripts/check_env.py
 ```
 
@@ -118,3 +152,37 @@ journalctl -u crypto-strategy -f
 
 - 如果程序部署在**云服务器**上：你本机可以关机，不影响运行。
 - 如果程序只跑在**你本机**：关机后程序必然停止。
+
+
+## 一键部署（本地电脑实验）
+
+### Windows
+
+```bat
+one_click_deploy.bat
+```
+
+该命令会：
+1. 调用 `setup_env.bat` 安装环境
+2. 安装 `flask`
+3. 启动本地 UI（`http://127.0.0.1:8501`）
+
+UI 中提供按钮：
+- 运行一次策略
+- 开启持续测试（一直跑）
+- 开启自动下单
+- 停止后台任务
+- 查看 K 线图
+
+另外我提供了操作指南文件：`OPERATION_GUIDE.txt`。
+
+
+## 关机后历史数据会清空吗？
+
+不会。只要你**不删除项目目录的 runtime 文件夹**，历史会一直保留。
+
+当前会持久化两份历史：
+- `runtime/signal_history.jsonl`（追加文本日志）
+- `runtime/history.db`（SQLite结构化历史库，便于后续查询统计）
+
+重启电脑后再次启动程序，会继续在上述文件基础上追加，不会自动清空。

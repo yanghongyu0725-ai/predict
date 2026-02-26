@@ -1,0 +1,33 @@
+一键部署与使用（Windows）
+
+1) 拉取代码
+   git pull
+
+2) 一键部署并启动 UI
+   one_click_deploy.bat
+
+3) 打开界面
+   浏览器访问: http://127.0.0.1:8501
+
+4) 页面按钮说明
+   - 运行一次策略: 单次跑完输出最新统计
+   - 开启持续测试(daemon): 持续跑全量测试
+   - 开启自动下单(daemon): 按策略自动下单
+   - 停止后台任务: 结束后台进程
+   - 查看K线图: 查看最新 15m 图
+
+5) 自动下单前先设置环境变量（CMD）
+   set BINANCE_API_KEY=你的key
+   set BINANCE_API_SECRET=你的secret
+
+6) 关键输出文件
+   runtime\latest_signal.json
+   runtime\strategy_metrics_latest.json
+   runtime\signal_history.jsonl
+   runtime\heartbeat.jsonl
+   runtime\errors.jsonl
+
+7) 策略选择规则
+   - 自动下单启用时，先看历史测试结果
+   - 禁用 return_rate <= 0 的策略
+   - 在 return_rate > 0 的策略中，优先使用收益率最高策略

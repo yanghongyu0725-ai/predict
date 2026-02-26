@@ -1,0 +1,17 @@
+[Unit]
+Description=Crypto Strategy Daemon (Binance)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/crypto-strategy
+Environment=BINANCE_API_KEY=your_api_key
+Environment=BINANCE_API_SECRET=your_api_secret
+ExecStart=/opt/crypto-strategy/.venv/bin/python /opt/crypto-strategy/crypto_deep_strategy.py --symbol BTC/USDT --daemon --interval_minutes 15 --output_dir /opt/crypto-strategy/runtime
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

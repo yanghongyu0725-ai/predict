@@ -14,6 +14,9 @@ echo ==================================================>>%DEPLOY_LOG%
 echo [%date% %time%] one_click_deploy start >>%DEPLOY_LOG%
 echo UI_URL=%UI_URL% >>%DEPLOY_LOG%
 
+echo [INFO] 部署日志: %DEPLOY_LOG%
+echo [INFO] UI日志: %UI_LOG%
+
 echo [STEP] 1/5 初始化运行环境...
 call setup_env.bat
 if errorlevel 1 (
@@ -33,6 +36,7 @@ if errorlevel 1 (
 )
 
 echo [STEP] 3/5 运行依赖检查...
+python scripts/check_env.py
 python scripts/check_env.py >>%DEPLOY_LOG% 2>&1
 if errorlevel 1 (
   echo [WARN] 依赖检查失败，尝试执行完整依赖安装...
@@ -79,6 +83,7 @@ for /l %%i in (1,1,15) do (
 
 echo [WARN] 未检测到UI已就绪，请查看日志: %UI_LOG%
 echo [WARN] 部署日志: %DEPLOY_LOG%
+echo [TIP] 可运行 diagnose_ui.bat 一键收集诊断信息
 echo [%date% %time%] WARN ui not ready in timeout window >>%DEPLOY_LOG%
 if exist %UI_LOG% (
   echo -------- ui_server.log 最后40行 --------

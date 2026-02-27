@@ -16,7 +16,8 @@ python --version 2>&1
 
 echo.
 echo [2] 关键依赖检查
-python scripts/check_env.py 2>&1
+python scripts/check_env.py --mode ui 2>&1
+python scripts/check_env.py --mode full 2>&1
 
 echo.
 echo [3] 8501端口监听状态

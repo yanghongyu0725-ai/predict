@@ -38,19 +38,25 @@ if errorlevel 1 (
 )
 
 echo [STEP] 3/5 运行依赖检查...
-python scripts/check_env.py
-python scripts/check_env.py >>%DEPLOY_LOG% 2>&1
+python scripts/check_env.py --mode ui
+python scripts/check_env.py --mode ui >>%DEPLOY_LOG% 2>&1
 if errorlevel 1 (
-  echo [WARN] 依赖检查失败，尝试执行完整依赖安装...
-  echo [%date% %time%] WARN check_env failed, trying full requirements install >>%DEPLOY_LOG%
+  echo [WARN] UI依赖检查失败，尝试执行完整依赖安装...
+  echo [%date% %time%] WARN check_env(ui) failed, trying full requirements install >>%DEPLOY_LOG%
   python -m pip install -r requirements.txt >>%DEPLOY_LOG% 2>&1
-  python scripts/check_env.py >>%DEPLOY_LOG% 2>&1
+  python scripts/check_env.py --mode ui >>%DEPLOY_LOG% 2>&1
   if errorlevel 1 (
-    echo [ERROR] 依赖检查仍未通过，请查看 %DEPLOY_LOG%
-    echo [%date% %time%] ERROR check_env failed after requirements reinstall >>%DEPLOY_LOG%
+    echo [ERROR] UI依赖检查仍未通过，请查看 %DEPLOY_LOG%
+    echo [%date% %time%] ERROR check_env(ui) failed after requirements reinstall >>%DEPLOY_LOG%
     pause
     exit /b 1
   )
+)
+
+python scripts/check_env.py --mode full >>%DEPLOY_LOG% 2>&1
+if errorlevel 1 (
+  echo [WARN] 全量策略依赖未通过（不影响UI启动），后续运行策略时可能失败。
+  echo [%date% %time%] WARN check_env(full) failed; continue for UI only >>%DEPLOY_LOG%
 )
 
 python -c "import sys;import flask,ccxt,pandas,plotly,dateutil;print('ui-import-check-ok')" >>%DEPLOY_LOG% 2>&1

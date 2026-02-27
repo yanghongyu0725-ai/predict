@@ -33,25 +33,31 @@ if errorlevel 1 (
 )
 
 echo [STEP] 3/5 运行依赖检查...
-python scripts/check_env.py
+python scripts/check_env.py >>%DEPLOY_LOG% 2>&1
 if errorlevel 1 (
-  echo [ERROR] 依赖仍缺失，尝试自动补装 Flask 后重试检查...
-  echo [%date% %time%] WARN check_env failed, trying flask reinstall >>%DEPLOY_LOG%
-  python -m pip install flask
-  python scripts/check_env.py
+  echo [WARN] 依赖检查失败，尝试执行完整依赖安装...
+  echo [%date% %time%] WARN check_env failed, trying full requirements install >>%DEPLOY_LOG%
+  python -m pip install -r requirements.txt >>%DEPLOY_LOG% 2>&1
+  python scripts/check_env.py >>%DEPLOY_LOG% 2>&1
   if errorlevel 1 (
-    echo [ERROR] 依赖检查仍未通过，请先排查 pip 网络连接问题。
-    echo [%date% %time%] ERROR check_env failed after retry >>%DEPLOY_LOG%
+    echo [ERROR] 依赖检查仍未通过，请查看 %DEPLOY_LOG%
+    echo [%date% %time%] ERROR check_env failed after requirements reinstall >>%DEPLOY_LOG%
     pause
     exit /b 1
   )
 )
 
-python -c "import flask,ccxt,pandas,plotly;print('import-check-ok')" >>%DEPLOY_LOG% 2>&1
+python -c "import importlib.util,sys;mods=['flask','ccxt','pandas','plotly'];miss=[m for m in mods if importlib.util.find_spec(m) is None];print('missing=' + ','.join(miss));sys.exit(1 if miss else 0)" >>%DEPLOY_LOG% 2>&1
 if errorlevel 1 (
-  echo [ERROR] 关键依赖导入失败，请查看 %DEPLOY_LOG%
-  pause
-  exit /b 1
+  echo [WARN] UI关键依赖缺失，尝试自动安装 flask/ccxt/pandas/plotly...
+  echo [%date% %time%] WARN ui import check failed, installing ui deps >>%DEPLOY_LOG%
+  python -m pip install flask ccxt pandas plotly >>%DEPLOY_LOG% 2>&1
+  python -c "import importlib.util,sys;mods=['flask','ccxt','pandas','plotly'];miss=[m for m in mods if importlib.util.find_spec(m) is None];print('missing=' + ','.join(miss));sys.exit(1 if miss else 0)" >>%DEPLOY_LOG% 2>&1
+  if errorlevel 1 (
+    echo [ERROR] 关键依赖导入失败，请查看 %DEPLOY_LOG%
+    pause
+    exit /b 1
+  )
 )
 
 echo [STEP] 4/5 启动本地UI进程...

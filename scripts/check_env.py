@@ -11,6 +11,8 @@ REQUIRED = [
     "sklearn",
     "tensorflow",
     "ccxt",
+    "plotly",
+    "flask",
 ]
 
 missing = [name for name in REQUIRED if importlib.util.find_spec(name) is None]

@@ -189,3 +189,30 @@ UI 中提供按钮：
 
 
 补充：UI 里 K线图会固定显示在页面顶部；未生成时会显示提示，运行一次策略后自动可见。
+
+
+## 代码冲突不会处理怎么办（自动覆盖方案）
+
+如果你希望“每次都以远端代码为准，自动覆盖本地冲突”，可以使用强制同步脚本：
+
+### Windows CMD
+
+```bat
+force_sync.bat main
+```
+
+### Windows PowerShell
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\force_sync.ps1 -Branch main
+```
+
+### Linux/macOS/Git-Bash
+
+```bash
+bash scripts/force_sync.sh main
+```
+
+说明：
+- 该操作会执行 `reset --hard` + `clean -fd`，会清除本地未提交改动。
+- 脚本会自动创建一个本地快照分支 `backup-before-force-sync-时间戳` 供回滚。

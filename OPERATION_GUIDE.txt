@@ -40,3 +40,8 @@
 9) UI 反馈
    - 按钮点击后会有成功提示信息
    - K线图区域固定在页面顶部，未生成时显示提示，生成后无需手动跳转。
+
+10) 不会解冲突时的一键覆盖（以远端为准）
+   CMD: force_sync.bat main
+   PowerShell: powershell -ExecutionPolicy Bypass -File .\force_sync.ps1 -Branch main
+   说明: 会覆盖本地未提交代码，但会先自动创建 backup-before-force-sync-时间戳 快照分支。

@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import subprocess
 import sys
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Tuple
@@ -20,6 +22,19 @@ ROOT = Path(__file__).resolve().parent
 RUNTIME = ROOT / "runtime"
 PIDS = RUNTIME / "ui_pids.json"
 LIVE_LOG = RUNTIME / "ui_live.log"
+UI_DEBUG_LOG = RUNTIME / "ui_app_debug.log"
+
+RUNTIME.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[
+        logging.FileHandler(UI_DEBUG_LOG, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+logger = logging.getLogger("ui_app")
+logger.info("UI app module initialized")
 
 SYMBOLS = ["BTC/USDT", "ETH/USDT"]
 TIMEFRAMES = ["1m", "15m", "1h", "4h", "1d", "1w"]
@@ -131,6 +146,7 @@ def run_proc(name: str, auto_trade: bool, symbol: str) -> None:
     cmd = [sys.executable, "crypto_deep_strategy.py", "--symbol", symbol, "--daemon", "--interval_minutes", "15", "--output_dir", "runtime"]
     if auto_trade:
         cmd.append("--auto_trade")
+    logger.info("Starting process name=%s auto_trade=%s symbol=%s", name, auto_trade, symbol)
     p = subprocess.Popen(cmd, cwd=ROOT)
     data = load_pids()
     data[name] = p.pid
@@ -156,11 +172,14 @@ def fetch_market(symbol: str, timeframe: str, limit: int = 200) -> Tuple[pd.Data
                 continue
             df = pd.DataFrame(rows, columns=["ts", "Open", "High", "Low", "Close", "Volume"])
             df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+            logger.info("Fetched market data symbol=%s timeframe=%s exchange=%s rows=%s", symbol, timeframe, ex_name, len(df))
             return df, ex_name
         except Exception as e:
+            logger.warning("Fetch market failed exchange=%s symbol=%s timeframe=%s error=%s", ex_name, symbol, timeframe, e)
             errors.append(f"{ex_name}: {e}")
             continue
 
+    logger.error("All exchanges failed symbol=%s timeframe=%s errors=%s", symbol, timeframe, " ; ".join(errors))
     raise RuntimeError(" ; ".join(errors))
 
 
@@ -297,4 +316,12 @@ def chart():
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=8501)
+    try:
+        logger.info("Starting Flask server on 127.0.0.1:8501")
+        app.run(host="127.0.0.1", port=8501)
+    except Exception as exc:
+        logger.exception("Flask server crashed: %s", exc)
+        append_live_log(f"UI启动失败: {exc}")
+        with UI_DEBUG_LOG.open("a", encoding="utf-8") as f:
+            f.write(traceback.format_exc() + "\n")
+        raise

@@ -4,10 +4,13 @@
    git pull
 
 2) 一键部署并启动 UI
-   one_click_deploy.bat
+   CMD: one_click_deploy.bat
+   PowerShell: powershell -ExecutionPolicy Bypass -File .\one_click_deploy.ps1
 
 3) 打开界面
    浏览器访问: http://127.0.0.1:8501
+
+   说明: 一键部署会自动做环境安装+依赖检查，缺依赖会尝试自动补装。
 
 4) 页面按钮说明
    - 运行一次策略: 单次跑完输出最新统计
@@ -45,3 +48,9 @@
    CMD: force_sync.bat main
    PowerShell: powershell -ExecutionPolicy Bypass -File .\force_sync.ps1 -Branch main
    说明: 会覆盖本地未提交代码，但会先自动创建 backup-before-force-sync-时间戳 快照分支。
+
+11) 实时监控
+   - 支持标的切换: BTC/USDT, ETH/USDT
+   - 支持周期切换: 1m, 15m, 1h, 4h, 1d, 1w
+   - 页面每10秒自动刷新当前价格和信号
+   - 实时日志窗口会持续输出运行状态和触发日志

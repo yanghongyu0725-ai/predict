@@ -162,10 +162,17 @@ journalctl -u crypto-strategy -f
 one_click_deploy.bat
 ```
 
+或 PowerShell：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\one_click_deploy.ps1
+```
+
 该命令会：
-1. 调用 `setup_env.bat` 安装环境
-2. 安装 `flask`
-3. 启动本地 UI（`http://127.0.0.1:8501`）
+1. 自动初始化环境（`setup_env`）
+2. 自动检查依赖（`python scripts/check_env.py`）
+3. 若缺失依赖会尝试自动补装
+4. 启动本地 UI（`http://127.0.0.1:8501`）
 
 UI 中提供按钮：
 - 运行一次策略
@@ -173,6 +180,15 @@ UI 中提供按钮：
 - 开启自动下单
 - 停止后台任务
 - 查看 K 线图
+
+
+UI 新增：
+- 支持 BTC/ETH 切换
+- 支持 1m / 15m / 1h / 4h / 1d / 1w 切换
+- 每10秒自动刷新当前价格与信号状态
+- 增加实时日志窗口，记录“是否触发策略/当前运行状态”
+- K线图在页面顶部固定显示（不需要跳转）
+
 
 另外我提供了操作指南文件：`OPERATION_GUIDE.txt`。
 

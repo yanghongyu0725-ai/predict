@@ -1,0 +1,60 @@
+一键部署与使用（Windows）
+
+1) 拉取代码
+   git pull
+
+2) 一键部署并启动 UI
+   CMD: one_click_deploy.bat
+   PowerShell: powershell -ExecutionPolicy Bypass -File .\one_click_deploy.ps1
+
+3) 打开界面
+   浏览器访问: http://127.0.0.1:8501
+
+   说明: 一键部署会自动做环境安装+依赖检查，缺依赖会尝试自动补装。
+
+4) 页面按钮说明
+   - 运行一次策略: 单次跑完输出最新统计
+   - 开启持续测试(daemon): 持续跑全量测试
+   - 开启自动下单(daemon): 按策略自动下单
+   - 停止后台任务: 结束后台进程
+   - 查看K线图: 查看最新 15m 图
+
+5) 自动下单前先设置环境变量（CMD）
+   set BINANCE_API_KEY=你的key
+   set BINANCE_API_SECRET=你的secret
+
+6) 关键输出文件
+   runtime\latest_signal.json
+   runtime\strategy_metrics_latest.json
+   runtime\signal_history.jsonl
+   runtime\heartbeat.jsonl
+   runtime\errors.jsonl
+   runtime\history.db
+
+7) 策略选择规则
+   - 自动下单启用时，先看历史测试结果
+   - 禁用 return_rate <= 0 的策略
+   - 在 return_rate > 0 的策略中，优先使用收益率最高策略
+
+8) 关机后历史是否保留
+   - 会保留。历史写入 runtime\signal_history.jsonl 和 runtime\history.db
+   - 只要不删除 runtime 文件夹，重启后会继续累计。
+
+9) UI 反馈
+   - 按钮点击后会有成功提示信息
+   - K线图区域固定在页面顶部，未生成时显示提示，生成后无需手动跳转。
+
+10) 不会解冲突时的一键覆盖（以远端为准）
+   CMD: force_sync.bat main
+   PowerShell: powershell -ExecutionPolicy Bypass -File .\force_sync.ps1 -Branch main
+   说明: 会覆盖本地未提交代码，但会先自动创建 backup-before-force-sync-时间戳 快照分支。
+
+11) 实时监控
+   - 支持标的切换: BTC/USDT, ETH/USDT
+   - 支持周期切换: 1m, 15m, 1h, 4h, 1d, 1w
+   - 页面每10秒自动刷新当前价格和信号
+   - 实时日志窗口会持续输出运行状态和触发日志
+
+12) 遇到 Binance 451 地区限制
+   - UI 会自动尝试 Bybit / OKX 拉取行情，不会直接空白。
+   - 可手动指定优先交易所: set PREFERRED_EXCHANGE=bybit

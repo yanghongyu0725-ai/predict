@@ -11,21 +11,27 @@ set UI_LOG=%LOG_DIR%\ui_server.log
 set UI_DEBUG_LOG=%LOG_DIR%\ui_app_debug.log
 set LIVE_LOG=%LOG_DIR%\ui_live.log
 set UI_PORT=8501
+set VENV_PYTHON=.venv\Scripts\python.exe
+set PY_CMD=python
 
 if not exist %LOG_DIR% mkdir %LOG_DIR%
+if exist %VENV_PYTHON% (
+  set PY_CMD=%VENV_PYTHON%
+)
 
 echo ===== UI Diagnose (%date% %time%) =====
+echo [0] Python command in use: %PY_CMD%
 echo [1] Python 版本
-python --version 2>&1
+%PY_CMD% --version 2>&1
 
 echo [1.1] Python可执行文件
-python -c "import sys;print(sys.executable)" 2>&1
-python -c "import dateutil,sys;print(dateutil.__file__)" 2>&1
+%PY_CMD% -c "import sys;print(sys.executable)" 2>&1
+%PY_CMD% -c "import dateutil,sys;print(dateutil.__file__)" 2>&1
 
 echo.
 echo [2] 关键依赖检查
-python scripts/check_env.py --mode ui 2>&1
-python scripts/check_env.py --mode full 2>&1
+%PY_CMD% scripts/check_env.py --mode ui 2>&1
+%PY_CMD% scripts/check_env.py --mode full 2>&1
 
 echo.
 echo [3] 8501端口监听状态

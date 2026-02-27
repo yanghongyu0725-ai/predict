@@ -80,7 +80,11 @@ if errorlevel 1 goto :fail_ui_check
 
 echo [STEP] 4/5 Start UI process...
 echo [%date% %time%] starting ui server >>"%DEPLOY_LOG%"
-start "Strategy UI Server" cmd /k "call .venv\Scripts\activate.bat && \"%VENV_PYTHON%\" ui_app.py 1>>\"%UI_LOG%\" 2>&1"
+start "Strategy UI Server" cmd /k call .venv\Scripts\activate.bat ^&^& "%VENV_PYTHON%" ui_app.py 1>>"%UI_LOG%" 2>&1
+if errorlevel 1 (
+  echo [ERROR] failed to launch UI server process. >>"%DEPLOY_LOG%"
+  goto :fail_ui_check
+)
 
 echo [STEP] 5/5 Check UI health and open browser...
 for /l %%i in (1,1,20) do (
@@ -99,6 +103,7 @@ echo [WARN] %UI_LOG%
 echo [WARN] %DEPLOY_LOG%
 echo [TIP] Run diagnose_ui.bat for one-click diagnostics.
 echo [%date% %time%] WARN ui not ready in timeout window >>"%DEPLOY_LOG%"
+tasklist | findstr /I "python.exe" >>"%DEPLOY_LOG%" 2>&1
 if exist "%UI_LOG%" (
   echo -------- ui_server.log tail 60 --------
   powershell -NoProfile -Command "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; Get-Content -Encoding UTF8 -Tail 60 '%UI_LOG%'"

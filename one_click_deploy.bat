@@ -1,7 +1,8 @@
 @echo off
 setlocal
 chcp 65001 >nul
-
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
 
 set UI_HOST=127.0.0.1
 set UI_PORT=8501
@@ -18,6 +19,10 @@ echo UI_URL=%UI_URL% >>%DEPLOY_LOG%
 
 echo [INFO] 部署日志: %DEPLOY_LOG%
 echo [INFO] UI日志: %UI_LOG%
+
+echo [INFO] Python可执行文件路径: 
+python -c "import sys;print(sys.executable)"
+python -c "import sys;print(sys.executable)" >>%DEPLOY_LOG% 2>&1
 
 echo [STEP] 1/5 初始化运行环境...
 call setup_env.bat
@@ -44,10 +49,15 @@ if errorlevel 1 (
   echo [WARN] UI依赖检查失败，尝试执行完整依赖安装...
   echo [%date% %time%] WARN check_env(ui) failed, trying full requirements install >>%DEPLOY_LOG%
   python -m pip install -r requirements.txt >>%DEPLOY_LOG% 2>&1
+  python -m pip uninstall -y python-dateutil >>%DEPLOY_LOG% 2>&1
+  python -m pip install --no-cache-dir --force-reinstall python-dateutil pandas >>%DEPLOY_LOG% 2>&1
+  python -m pip show python-dateutil >>%DEPLOY_LOG% 2>&1
+  python -c "import dateutil,sys;print('dateutil_ok',dateutil.__file__,sys.executable)" >>%DEPLOY_LOG% 2>&1
   python scripts/check_env.py --mode ui >>%DEPLOY_LOG% 2>&1
   if errorlevel 1 (
     echo [ERROR] UI依赖检查仍未通过，请查看 %DEPLOY_LOG%
-    echo [%date% %time%] ERROR check_env(ui) failed after requirements reinstall >>%DEPLOY_LOG%
+    echo [ERROR] 可手动执行: python -m pip install --no-cache-dir --force-reinstall python-dateutil pandas
+    echo [%date% %time%] ERROR check_env(ui) failed after dateutil repair >>%DEPLOY_LOG%
     pause
     exit /b 1
   )
@@ -79,7 +89,7 @@ start "Strategy UI Server" cmd /k "call .venv\Scripts\activate.bat && python ui_
 
 echo [STEP] 5/5 检查服务状态并打开浏览器...
 for /l %%i in (1,1,15) do (
-  powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort %UI_PORT% -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty State" >>%DEPLOY_LOG% 2>&1
+  powershell -NoProfile -Command "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; Get-NetTCPConnection -LocalPort %UI_PORT% -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty State" >>%DEPLOY_LOG% 2>&1
   powershell -NoProfile -Command "try { $r=Invoke-WebRequest -UseBasicParsing -Uri '%UI_URL%' -TimeoutSec 2; if($r.StatusCode -ge 200){ exit 0 } else { exit 1 } } catch { exit 1 }"
   if not errorlevel 1 (
     start "Strategy UI" %UI_URL%
@@ -96,7 +106,7 @@ echo [TIP] 可运行 diagnose_ui.bat 一键收集诊断信息
 echo [%date% %time%] WARN ui not ready in timeout window >>%DEPLOY_LOG%
 if exist %UI_LOG% (
   echo -------- ui_server.log 最后40行 --------
-  powershell -NoProfile -Command "Get-Content -Tail 40 '%UI_LOG%'"
+  powershell -NoProfile -Command "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; Get-Content -Encoding UTF8 -Tail 40 '%UI_LOG%'"
 )
 start "Strategy UI" %UI_URL%
 

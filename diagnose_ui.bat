@@ -1,5 +1,9 @@
 @echo off
 setlocal
+chcp 65001 >nul
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
+
 
 set LOG_DIR=runtime
 set DEPLOY_LOG=%LOG_DIR%\one_click_deploy.log
@@ -14,6 +18,10 @@ echo ===== UI Diagnose (%date% %time%) =====
 echo [1] Python 版本
 python --version 2>&1
 
+echo [1.1] Python可执行文件
+python -c "import sys;print(sys.executable)" 2>&1
+python -c "import dateutil,sys;print(dateutil.__file__)" 2>&1
+
 echo.
 echo [2] 关键依赖检查
 python scripts/check_env.py --mode ui 2>&1
@@ -21,7 +29,7 @@ python scripts/check_env.py --mode full 2>&1
 
 echo.
 echo [3] 8501端口监听状态
-powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort %UI_PORT% -ErrorAction SilentlyContinue | Format-Table -AutoSize LocalAddress,LocalPort,State,OwningProcess" 2>nul
+powershell -NoProfile -Command "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; Get-NetTCPConnection -LocalPort %UI_PORT% -ErrorAction SilentlyContinue | Format-Table -AutoSize LocalAddress,LocalPort,State,OwningProcess" 2>nul
 if errorlevel 1 (
   echo (Get-NetTCPConnection不可用，尝试netstat)
 )
@@ -29,7 +37,7 @@ netstat -ano | findstr :%UI_PORT%
 
 echo.
 echo [4] HTTP探测
-powershell -NoProfile -Command "try { $r=Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:%UI_PORT%' -TimeoutSec 3; Write-Output ('HTTP ' + $r.StatusCode) } catch { Write-Output ('HTTP_FAIL ' + $_.Exception.Message); exit 1 }"
+powershell -NoProfile -Command "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; try { $r=Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:%UI_PORT%' -TimeoutSec 3; Write-Output ('HTTP ' + $r.StatusCode) } catch { Write-Output ('HTTP_FAIL ' + $_.Exception.Message); exit 1 }"
 
 echo.
 echo [5] 日志文件路径
@@ -41,7 +49,7 @@ echo LIVE_LOG=%LIVE_LOG%
 echo.
 if exist %DEPLOY_LOG% (
   echo ===== one_click_deploy.log (tail 60) =====
-  powershell -NoProfile -Command "Get-Content -Tail 60 '%DEPLOY_LOG%'"
+  powershell -NoProfile -Command "Get-Content -Encoding UTF8 -Tail 60 '%DEPLOY_LOG%'"
 ) else (
   echo [WARN] 未找到 %DEPLOY_LOG%
 )
@@ -49,7 +57,7 @@ if exist %DEPLOY_LOG% (
 echo.
 if exist %UI_LOG% (
   echo ===== ui_server.log (tail 80) =====
-  powershell -NoProfile -Command "Get-Content -Tail 80 '%UI_LOG%'"
+  powershell -NoProfile -Command "Get-Content -Encoding UTF8 -Tail 80 '%UI_LOG%'"
 ) else (
   echo [WARN] 未找到 %UI_LOG%
 )
@@ -57,7 +65,7 @@ if exist %UI_LOG% (
 echo.
 if exist %UI_DEBUG_LOG% (
   echo ===== ui_app_debug.log (tail 80) =====
-  powershell -NoProfile -Command "Get-Content -Tail 80 '%UI_DEBUG_LOG%'"
+  powershell -NoProfile -Command "Get-Content -Encoding UTF8 -Tail 80 '%UI_DEBUG_LOG%'"
 ) else (
   echo [WARN] 未找到 %UI_DEBUG_LOG%
 )
@@ -65,7 +73,7 @@ if exist %UI_DEBUG_LOG% (
 echo.
 if exist %LIVE_LOG% (
   echo ===== ui_live.log (tail 80) =====
-  powershell -NoProfile -Command "Get-Content -Tail 80 '%LIVE_LOG%'"
+  powershell -NoProfile -Command "Get-Content -Encoding UTF8 -Tail 80 '%LIVE_LOG%'"
 ) else (
   echo [WARN] 未找到 %LIVE_LOG%
 )

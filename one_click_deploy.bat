@@ -14,7 +14,7 @@ set "VENV_PYTHON=.venv\Scripts\python.exe"
 
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
 
-echo ==================================================>>"%DEPLOY_LOG%"
+echo ==================================================>"%DEPLOY_LOG%"
 echo [%date% %time%] one_click_deploy start >>"%DEPLOY_LOG%"
 echo UI_URL=%UI_URL% >>"%DEPLOY_LOG%"
 
@@ -71,7 +71,7 @@ if errorlevel 1 goto :fail_ui_check
 :check_full
 "%VENV_PYTHON%" scripts/check_env.py --mode full >>"%DEPLOY_LOG%" 2>&1
 if errorlevel 1 (
-  echo [WARN] Full strategy dependency check failed (UI can still start).
+  echo [WARN] Full strategy dependency check failed (UI can still start; strategy run may fail).
   echo [%date% %time%] WARN check_env(full) failed; continue for UI only >>"%DEPLOY_LOG%"
 )
 

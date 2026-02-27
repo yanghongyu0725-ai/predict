@@ -22,7 +22,7 @@ FULL_ONLY_MODULES = [
 ]
 
 
-def run_checks(modules: list[str]) -> tuple[list[str], list[str]]:
+def run_import_checks(modules: list[str]) -> tuple[list[str], list[str]]:
     missing_specs = [name for name in modules if importlib.util.find_spec(name) is None]
     import_errors: list[str] = []
     for name in modules:
@@ -31,6 +31,10 @@ def run_checks(modules: list[str]) -> tuple[list[str], list[str]]:
         except Exception as exc:
             import_errors.append(f"{name}: {exc}")
     return missing_specs, import_errors
+
+
+def run_spec_checks(modules: list[str]) -> list[str]:
+    return [name for name in modules if importlib.util.find_spec(name) is None]
 
 
 def print_fix_hints() -> None:
@@ -46,23 +50,52 @@ def print_fix_hints() -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Environment dependency checker")
     parser.add_argument("--mode", choices=["ui", "full"], default="full", help="ui=UI启动依赖，full=策略全量依赖")
+    parser.add_argument("--strict-full", action="store_true", help="full模式下也执行重依赖导入（默认仅做存在性检查）")
     args = parser.parse_args()
 
-    modules = COMMON_MODULES if args.mode == "ui" else COMMON_MODULES + FULL_ONLY_MODULES
-    missing_specs, import_errors = run_checks(modules)
+    if args.mode == "ui":
+        missing_specs, import_errors = run_import_checks(COMMON_MODULES)
+        if missing_specs or import_errors:
+            print("[ERROR] 模式=ui 依赖检查失败")
+            if missing_specs:
+                print("[ERROR] 缺少依赖:", ", ".join(missing_specs))
+            if import_errors:
+                print("[ERROR] 依赖导入失败:")
+                for item in import_errors:
+                    print(" -", item)
+            print_fix_hints()
+            return 1
+        print("[OK] 模式=ui 运行环境完整")
+        return 0
+
+    # full mode
+    missing_common, common_import_errors = run_import_checks(COMMON_MODULES)
+    if args.strict_full:
+        missing_full, full_import_errors = run_import_checks(FULL_ONLY_MODULES)
+    else:
+        missing_full = run_spec_checks(FULL_ONLY_MODULES)
+        full_import_errors = []
+
+    missing_specs = missing_common + [m for m in missing_full if m not in missing_common]
+    import_errors = common_import_errors + full_import_errors
 
     if missing_specs or import_errors:
-        print(f"[ERROR] 模式={args.mode} 依赖检查失败")
+        print("[ERROR] 模式=full 依赖检查失败")
         if missing_specs:
             print("[ERROR] 缺少依赖:", ", ".join(missing_specs))
         if import_errors:
             print("[ERROR] 依赖导入失败:")
             for item in import_errors:
                 print(" -", item)
+        if not args.strict_full:
+            print("[INFO] full模式默认不导入重依赖(tensorflow/sklearn)，仅检查是否可发现。")
         print_fix_hints()
         return 1
 
-    print(f"[OK] 模式={args.mode} 运行环境完整")
+    if not args.strict_full:
+        print("[OK] 模式=full 运行环境完整（重依赖采用存在性检查）")
+    else:
+        print("[OK] 模式=full 运行环境完整")
     return 0
 
 

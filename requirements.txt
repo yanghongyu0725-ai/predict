@@ -5,3 +5,5 @@ tensorflow>=2.12
 ccxt>=4.3
 plotly>=5.20
 flask>=3.0
+
+python-dateutil>=2.8.2

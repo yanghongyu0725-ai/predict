@@ -1,5 +1,7 @@
 @echo off
 setlocal
+chcp 65001 >nul
+
 
 set UI_HOST=127.0.0.1
 set UI_PORT=8501
@@ -51,12 +53,13 @@ if errorlevel 1 (
   )
 )
 
-python -c "import importlib.util,sys;mods=['flask','ccxt','pandas','plotly'];miss=[m for m in mods if importlib.util.find_spec(m) is None];print('missing=' + ','.join(miss));sys.exit(1 if miss else 0)" >>%DEPLOY_LOG% 2>&1
+python -c "import sys;import flask,ccxt,pandas,plotly,dateutil;print('ui-import-check-ok')" >>%DEPLOY_LOG% 2>&1
 if errorlevel 1 (
-  echo [WARN] UI关键依赖缺失，尝试自动安装 flask/ccxt/pandas/plotly...
+  echo [WARN] UI关键依赖导入失败，尝试自动修复 flask/ccxt/pandas/plotly/python-dateutil...
   echo [%date% %time%] WARN ui import check failed, installing ui deps >>%DEPLOY_LOG%
-  python -m pip install flask ccxt pandas plotly >>%DEPLOY_LOG% 2>&1
-  python -c "import importlib.util,sys;mods=['flask','ccxt','pandas','plotly'];miss=[m for m in mods if importlib.util.find_spec(m) is None];print('missing=' + ','.join(miss));sys.exit(1 if miss else 0)" >>%DEPLOY_LOG% 2>&1
+  python -m pip install --upgrade --force-reinstall python-dateutil pandas >>%DEPLOY_LOG% 2>&1
+  python -m pip install flask ccxt plotly >>%DEPLOY_LOG% 2>&1
+  python -c "import sys;import flask,ccxt,pandas,plotly,dateutil;print('ui-import-check-ok')" >>%DEPLOY_LOG% 2>&1
   if errorlevel 1 (
     echo [ERROR] 关键依赖导入失败，请查看 %DEPLOY_LOG%
     pause

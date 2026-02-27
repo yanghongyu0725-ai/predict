@@ -232,3 +232,6 @@ bash scripts/force_sync.sh main
 说明：
 - 该操作会执行 `reset --hard` + `clean -fd`，会清除本地未提交改动。
 - 脚本会自动创建一个本地快照分支 `backup-before-force-sync-时间戳` 供回滚。
+
+
+说明：如果你所在地区访问 Binance 返回 451，UI 会自动回退尝试 Bybit 和 OKX 数据源（可通过环境变量 `PREFERRED_EXCHANGE` 指定优先交易所）。

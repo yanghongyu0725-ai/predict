@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -22,6 +23,7 @@ LIVE_LOG = RUNTIME / "ui_live.log"
 
 SYMBOLS = ["BTC/USDT", "ETH/USDT"]
 TIMEFRAMES = ["1m", "15m", "1h", "4h", "1d", "1w"]
+EXCHANGES = ["binance", "bybit", "okx"]
 
 HTML = """
 <!doctype html><html><head><meta charset='utf-8'><title>策略控制台</title>
@@ -135,12 +137,31 @@ def run_proc(name: str, auto_trade: bool, symbol: str) -> None:
     save_pids(data)
 
 
-def fetch_market(symbol: str, timeframe: str, limit: int = 200) -> pd.DataFrame:
-    ex = ccxt.binance({"enableRateLimit": True})
-    rows = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    df = pd.DataFrame(rows, columns=["ts", "Open", "High", "Low", "Close", "Volume"])
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-    return df
+def fetch_market(symbol: str, timeframe: str, limit: int = 200) -> Tuple[pd.DataFrame, str]:
+    preferred = (os.getenv("PREFERRED_EXCHANGE", "").strip().lower())
+    exchanges = [preferred] + EXCHANGES if preferred else EXCHANGES
+    seen = set()
+    errors = []
+
+    for ex_name in exchanges:
+        if not ex_name or ex_name in seen:
+            continue
+        seen.add(ex_name)
+        try:
+            ex_class = getattr(ccxt, ex_name)
+            ex = ex_class({"enableRateLimit": True})
+            rows = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            if not rows:
+                errors.append(f"{ex_name}: empty ohlcv")
+                continue
+            df = pd.DataFrame(rows, columns=["ts", "Open", "High", "Low", "Close", "Volume"])
+            df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+            return df, ex_name
+        except Exception as e:
+            errors.append(f"{ex_name}: {e}")
+            continue
+
+    raise RuntimeError(" ; ".join(errors))
 
 
 def quick_signal(df: pd.DataFrame) -> Tuple[str, str]:
@@ -184,10 +205,10 @@ def api_market_status():
     symbol = request.args.get("symbol", "BTC/USDT")
     timeframe = request.args.get("timeframe", "15m")
     try:
-        df = fetch_market(symbol, timeframe, 250)
+        df, ex_name = fetch_market(symbol, timeframe, 250)
         price = float(df.iloc[-1]["Close"])
         signal, reason = quick_signal(df)
-        msg = f"{symbol} {timeframe} 当前价={price:.4f} 信号={signal} 原因={reason}"
+        msg = f"[{ex_name}] {symbol} {timeframe} 当前价={price:.4f} 信号={signal} 原因={reason}"
         append_live_log(msg)
         return jsonify({
             "ok": True,
@@ -197,10 +218,11 @@ def api_market_status():
             "price": price,
             "signal": signal,
             "reason": reason,
+            "exchange": ex_name,
             "message": msg,
         })
     except Exception as e:
-        append_live_log(f"ERROR {symbol} {timeframe} {e}")
+        append_live_log(f"ERROR {symbol} {timeframe} 所有交易所不可用: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -257,7 +279,7 @@ def chart():
     timeframe = request.args.get("timeframe", "15m")
     chart_file = RUNTIME / "chart_live.html"
     try:
-        df = fetch_market(symbol, timeframe, 400)
+        df, ex_name = fetch_market(symbol, timeframe, 400)
         fig = go.Figure(data=[
             go.Candlestick(
                 x=df["ts"],
@@ -265,12 +287,12 @@ def chart():
                 name=f"{symbol} {timeframe}",
             )
         ])
-        fig.update_layout(title=f"{symbol} {timeframe} 实时K线", xaxis_rangeslider_visible=False, template="plotly_dark")
+        fig.update_layout(title=f"[{ex_name}] {symbol} {timeframe} 实时K线", xaxis_rangeslider_visible=False, template="plotly_dark")
         chart_file.parent.mkdir(parents=True, exist_ok=True)
         fig.write_html(str(chart_file), include_plotlyjs="cdn")
         return send_file(chart_file)
     except Exception as e:
-        append_live_log(f"图表生成失败 {symbol} {timeframe} {e}")
+        append_live_log(f"图表生成失败 {symbol} {timeframe}（Binance可能受限，已尝试Bybit/OKX）: {e}")
         return f"<html><body style='font-family:Arial'><h3>图表生成失败: {e}</h3></body></html>"
 
 

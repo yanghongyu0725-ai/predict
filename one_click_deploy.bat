@@ -53,7 +53,7 @@ echo [WARN] UI dependency check failed, start repair...
 echo [%date% %time%] WARN check_env(ui) failed, start repair >>"%DEPLOY_LOG%"
 "%VENV_PYTHON%" -m pip install -r requirements.txt >>"%DEPLOY_LOG%" 2>&1
 "%VENV_PYTHON%" -m pip uninstall -y python-dateutil >>"%DEPLOY_LOG%" 2>&1
-"%VENV_PYTHON%" -m pip install --no-cache-dir --force-reinstall python-dateutil pandas >>"%DEPLOY_LOG%" 2>&1
+"%VENV_PYTHON%" -m pip install --no-cache-dir --force-reinstall python-dateutil pandas plotly flask ccxt >>"%DEPLOY_LOG%" 2>&1
 "%VENV_PYTHON%" -m pip show python-dateutil >>"%DEPLOY_LOG%" 2>&1
 "%VENV_PYTHON%" -c "import dateutil,sys;print('dateutil_ok',dateutil.__file__,sys.executable)" >>"%DEPLOY_LOG%" 2>&1
 "%VENV_PYTHON%" scripts/check_env.py --mode ui >>"%DEPLOY_LOG%" 2>&1
@@ -94,7 +94,7 @@ echo [%date% %time%] WARN check_env(full) failed; continue for UI only >>"%DEPLO
 
 :ui_import_check
 echo [%date% %time%] STEP3 ui-import-check begin >>"%DEPLOY_LOG%"
-"%VENV_PYTHON%" -c "import flask,ccxt,pandas,plotly,dateutil;print('ui-import-check-ok')" >>"%DEPLOY_LOG%" 2>&1
+"%VENV_PYTHON%" -c "import flask,ccxt,pandas,dateutil;import plotly.graph_objects as go;print('ui-import-check-ok')" >>"%DEPLOY_LOG%" 2>&1
 set "RC=%ERRORLEVEL%"
 echo [%date% %time%] STEP3 ui-import-check rc=%RC% >>"%DEPLOY_LOG%"
 if not "%RC%"=="0" goto :fail_ui_check
@@ -158,7 +158,7 @@ goto :exit_fail
 
 :fail_ui_check
 echo [ERROR] UI dependency/process check failed.
-echo [ERROR] Try: .venv\Scripts\python.exe -m pip install --no-cache-dir --force-reinstall python-dateutil pandas
+echo [ERROR] Try: .venv\Scripts\python.exe -m pip install --no-cache-dir --force-reinstall python-dateutil pandas plotly flask ccxt
 echo [%date% %time%] ERROR ui dependency/process check failed >>"%DEPLOY_LOG%"
 goto :exit_fail
 

@@ -16,16 +16,27 @@ COMMON_MODULES = [
     "dateutil",
 ]
 
+# Explicit submodule imports to catch broken/incomplete installs.
+COMMON_IMPORT_TARGETS = [
+    "numpy",
+    "pandas",
+    "ccxt",
+    "plotly",
+    "plotly.graph_objects",
+    "flask",
+    "dateutil",
+]
+
 FULL_ONLY_MODULES = [
     "sklearn",
     "tensorflow",
 ]
 
 
-def run_import_checks(modules: list[str]) -> tuple[list[str], list[str]]:
-    missing_specs = [name for name in modules if importlib.util.find_spec(name) is None]
+def run_import_checks(spec_modules: list[str], import_targets: list[str] | None = None) -> tuple[list[str], list[str]]:
+    missing_specs = [name for name in spec_modules if importlib.util.find_spec(name) is None]
     import_errors: list[str] = []
-    for name in modules:
+    for name in (import_targets or spec_modules):
         try:
             importlib.import_module(name)
         except Exception as exc:
@@ -54,7 +65,7 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.mode == "ui":
-        missing_specs, import_errors = run_import_checks(COMMON_MODULES)
+        missing_specs, import_errors = run_import_checks(COMMON_MODULES, COMMON_IMPORT_TARGETS)
         if missing_specs or import_errors:
             print("[ERROR] 模式=ui 依赖检查失败")
             if missing_specs:
@@ -69,7 +80,7 @@ def main() -> int:
         return 0
 
     # full mode
-    missing_common, common_import_errors = run_import_checks(COMMON_MODULES)
+    missing_common, common_import_errors = run_import_checks(COMMON_MODULES, COMMON_IMPORT_TARGETS)
     if args.strict_full:
         missing_full, full_import_errors = run_import_checks(FULL_ONLY_MODULES)
     else:

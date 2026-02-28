@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from sklearn.preprocessing import StandardScaler
+import tensorflow as tf
 from tensorflow.keras import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.optimizers import Adam
@@ -32,6 +33,7 @@ class StrategyParams:
     risk_reward: float = 1.6
     stop_atr_mult: float = 1.3
     max_risk_per_trade: float = 0.05
+    fee_per_trade: float = 0.0008
 
 
 @dataclass
@@ -150,11 +152,9 @@ def build_dataset(feat4: pd.DataFrame, seq_len: int, horizon: int) -> Tuple[np.n
     ]
     xdf = feat4[cols].dropna()
     y = y.loc[xdf.index]
-    x_scaled = StandardScaler().fit_transform(xdf)
-
     xs, ys, idx = [], [], []
-    for i in range(seq_len, len(x_scaled) - horizon):
-        xs.append(x_scaled[i - seq_len : i])
+    for i in range(seq_len, len(xdf) - horizon):
+        xs.append(xdf.iloc[i - seq_len : i].values)
         ys.append(y.iloc[i])
         idx.append(xdf.index[i])
     return np.asarray(xs, np.float32), np.asarray(ys, np.float32), idx
@@ -229,7 +229,7 @@ def signal_lstm_confluence(row: pd.Series) -> int:
     return 0
 
 
-def evaluate_strategy(data: pd.DataFrame, signal_fn: Callable[[pd.Series], int], horizon: int, risk_reward: float, stop_atr_mult: float) -> Dict[str, float]:
+def evaluate_strategy(data: pd.DataFrame, signal_fn: Callable[[pd.Series], int], horizon: int, risk_reward: float, stop_atr_mult: float, fee_per_trade: float) -> Dict[str, float]:
     rets = []
     for i in range(len(data) - horizon):
         row = data.iloc[i]
@@ -250,7 +250,8 @@ def evaluate_strategy(data: pd.DataFrame, signal_fn: Callable[[pd.Series], int],
             if (sig == 1 and px >= tp) or (sig == -1 and px <= tp):
                 exit_price = tp
                 break
-        rets.append(((exit_price - entry) / entry) * sig)
+        gross_ret = ((exit_price - entry) / entry) * sig
+        rets.append(gross_ret - fee_per_trade)
 
     if not rets:
         return {"trades": 0.0, "win_rate": 0.0, "profit_factor": 0.0, "return_rate": 0.0, "max_drawdown": 0.0}
@@ -390,10 +391,25 @@ def place_order_industrial(plan: Dict[str, float | str], params: StrategyParams,
 
 
 def select_best_strategy(results: Dict[str, Dict[str, float]], latest_row: pd.Series) -> Tuple[str, int]:
-    positive = {k: v for k, v in results.items() if v["return_rate"] > 0}
-    if not positive:
-        return "禁用(全部策略历史收益<=0)", 0
-    best_name = max(positive.keys(), key=lambda n: positive[n]["return_rate"])
+    def pass_quality_gate(m: Dict[str, float]) -> bool:
+        return (
+            m["trades"] >= 30
+            and m["return_rate"] > 0
+            and m["profit_factor"] >= 1.1
+            and m["win_rate"] >= 0.48
+            and m["max_drawdown"] >= -0.25
+        )
+
+    candidates = {k: v for k, v in results.items() if pass_quality_gate(v)}
+    if not candidates:
+        return "禁用(未通过稳健性过滤)", 0
+
+    def score(m: Dict[str, float]) -> float:
+        pf = min(m["profit_factor"], 3.0) / 3.0
+        dd_penalty = max(abs(min(m["max_drawdown"], 0.0)), 1e-6)
+        return m["return_rate"] * 0.55 + m["win_rate"] * 0.25 + pf * 0.20 - dd_penalty * 0.15
+
+    best_name = max(candidates.keys(), key=lambda n: score(candidates[n]))
     signal_map: Dict[str, Callable[[pd.Series], int]] = {
         "EMA单指标": lambda r: signal_ema(r, "h4"),
         "RSI单指标": lambda r: signal_rsi(r, "h4"),
@@ -407,6 +423,9 @@ def select_best_strategy(results: Dict[str, Dict[str, float]], latest_row: pd.Se
 
 
 def run_once(args: argparse.Namespace, params: StrategyParams, cfg: EngineConfig) -> Dict:
+    np.random.seed(42)
+    tf.random.set_seed(42)
+
     ex = get_exchange(args, with_keys=False)
     feat4, feat15 = load_features(ex, params.symbol)
     if feat4.empty or feat15.empty:
@@ -417,9 +436,11 @@ def run_once(args: argparse.Namespace, params: StrategyParams, cfg: EngineConfig
         raise RuntimeError("可训练样本不足")
 
     split = int(len(x) * 0.8)
+    scaler = StandardScaler().fit(x[:split].reshape(-1, x.shape[2]))
+    x_scaled = scaler.transform(x.reshape(-1, x.shape[2])).reshape(x.shape)
     model = build_model((x.shape[1], x.shape[2]))
-    model.fit(x[:split], y[:split], epochs=args.epochs, batch_size=32, verbose=0, validation_split=0.2)
-    probs = model.predict(x[split:], verbose=0).reshape(-1)
+    model.fit(x_scaled[:split], y[:split], epochs=args.epochs, batch_size=32, verbose=0, validation_split=0.2)
+    probs = model.predict(x_scaled[split:], verbose=0).reshape(-1)
 
     eval_df = feat4.loc[idx[split:]].copy()
     eval_df["model_prob"] = probs
@@ -435,7 +456,10 @@ def run_once(args: argparse.Namespace, params: StrategyParams, cfg: EngineConfig
         "多指标共振": signal_multi_confluence,
         "LSTM+多指标共振": signal_lstm_confluence,
     }
-    results = {name: evaluate_strategy(eval_df, fn, params.predict_horizon, params.risk_reward, params.stop_atr_mult) for name, fn in strategies.items()}
+    results = {
+        name: evaluate_strategy(eval_df, fn, params.predict_horizon, params.risk_reward, params.stop_atr_mult, params.fee_per_trade)
+        for name, fn in strategies.items()
+    }
 
     latest = eval_df.iloc[-1]
     best_strategy_name, sig = select_best_strategy(results, latest)
@@ -446,6 +470,15 @@ def run_once(args: argparse.Namespace, params: StrategyParams, cfg: EngineConfig
     sl = entry - stop_dist if sig == 1 else entry + stop_dist if sig == -1 else float("nan")
     tp = entry + stop_dist * params.risk_reward if sig == 1 else entry - stop_dist * params.risk_reward if sig == -1 else float("nan")
     t15, p15 = latest_15m_trigger(feat15, sig)
+    risk_gate = "pass"
+    if sig != 0 and t15 == "无触发":
+        sig = 0
+        direction = "空仓"
+        risk_gate = "blocked:no_15m_trigger"
+    if sig != 0 and abs(float(latest["model_prob"]) - 0.5) < 0.05:
+        sig = 0
+        direction = "空仓"
+        risk_gate = "blocked:model_confidence_low"
 
     plan = {
         "timestamp": datetime.utcnow().isoformat(),
@@ -460,6 +493,7 @@ def run_once(args: argparse.Namespace, params: StrategyParams, cfg: EngineConfig
         "stop_loss": sl,
         "take_profit": tp,
         "risk_reward": params.risk_reward,
+        "risk_gate": risk_gate,
     }
 
     execution = place_order_industrial(plan, params, args, cfg)

@@ -22,10 +22,12 @@ echo [INFO] Deploy log: %DEPLOY_LOG%
 echo [INFO] UI log: %UI_LOG%
 
 echo [STEP] 1/5 Setup environment...
+echo [%date% %time%] STEP1 setup_env begin >>"%DEPLOY_LOG%"
 call setup_env.bat
 if errorlevel 1 goto :fail_setup
 
 echo [STEP] 2/5 Activate virtual env...
+echo [%date% %time%] STEP2 activate begin >>"%DEPLOY_LOG%"
 call .venv\Scripts\activate.bat
 if errorlevel 1 goto :fail_activate
 
@@ -36,6 +38,7 @@ echo [INFO] Python in use: %VENV_PYTHON%
 "%VENV_PYTHON%" -c "import sys;print(sys.executable)" >>"%DEPLOY_LOG%" 2>&1
 
 echo [STEP] 3/5 Check dependencies...
+echo [%date% %time%] STEP3 check_env(ui) begin >>"%DEPLOY_LOG%"
 "%VENV_PYTHON%" scripts/check_env.py --mode ui
 if errorlevel 1 goto :repair_ui
 
@@ -69,25 +72,29 @@ set "VENV_PYTHON=.venv\Scripts\python.exe"
 if errorlevel 1 goto :fail_ui_check
 
 :check_full
+echo [%date% %time%] STEP3 check_env(full) begin >>"%DEPLOY_LOG%"
 "%VENV_PYTHON%" scripts/check_env.py --mode full >>"%DEPLOY_LOG%" 2>&1
 if errorlevel 1 (
   echo [WARN] Full strategy dependency check failed (UI can still start; strategy run may fail).
   echo [%date% %time%] WARN check_env(full) failed; continue for UI only >>"%DEPLOY_LOG%"
 )
 
+echo [%date% %time%] STEP3 ui-import-check begin >>"%DEPLOY_LOG%"
 "%VENV_PYTHON%" -c "import flask,ccxt,pandas,plotly,dateutil;print('ui-import-check-ok')" >>"%DEPLOY_LOG%" 2>&1
 if errorlevel 1 goto :fail_ui_check
 
 echo [STEP] 4/5 Start UI process...
 echo [%date% %time%] starting ui server >>"%DEPLOY_LOG%"
-start "Strategy UI Server" cmd /k call .venv\Scripts\activate.bat ^&^& "%VENV_PYTHON%" ui_app.py 1>>"%UI_LOG%" 2>&1
+start "Strategy UI Server" cmd /c ""%VENV_PYTHON%" ui_app.py 1>>"%UI_LOG%" 2>&1"
 if errorlevel 1 (
   echo [ERROR] failed to launch UI server process. >>"%DEPLOY_LOG%"
   goto :fail_ui_check
 )
 
 echo [STEP] 5/5 Check UI health and open browser...
+echo [%date% %time%] STEP5 healthcheck begin >>"%DEPLOY_LOG%"
 for /l %%i in (1,1,20) do (
+  echo [%date% %time%] healthcheck try %%i >>"%DEPLOY_LOG%"
   powershell -NoProfile -Command "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; try { $r=Invoke-WebRequest -UseBasicParsing -Uri '%UI_URL%' -TimeoutSec 2; if($r.StatusCode -ge 200){ exit 0 } else { exit 1 } } catch { exit 1 }"
   if not errorlevel 1 (
     start "Strategy UI" %UI_URL%

@@ -33,6 +33,8 @@ SIGNAL_STATE_FILE = RUNTIME / "signal_state.json"
 BACKTEST_STATUS_FILE = RUNTIME / "backtest_status.json"
 BACKTEST_REPORT_FILE = RUNTIME / "backtest_report.json"
 BACKTEST_REPORT_MD_FILE = RUNTIME / "backtest_report.md"
+BACKTEST_LOG_FILE = RUNTIME / "backtest_job.log"
+TRADE_DB_FILE = RUNTIME / "trade_journal.db"
 
 CN_TZ = ZoneInfo("Asia/Shanghai")
 SIGNAL_TIMEFRAME = "4h"  # 运行信号固定4h，与图表周期隔离
@@ -47,7 +49,7 @@ logger = logging.getLogger("ui_app")
 
 SYMBOLS = ["BTC/USDT", "ETH/USDT"]
 TIMEFRAMES = ["1m", "15m", "1h", "4h", "1d", "1w"]
-EXCHANGES = ["bybit", "okx", "binance"]
+EXCHANGES = ["kraken", "coinbase", "bitstamp", "bybit", "okx", "binance"]
 MARKET_CACHE: Dict[Tuple[str, str, int], Dict] = {}
 BACKTEST_LOCK = threading.Lock()
 BACKTEST_THREAD: threading.Thread | None = None
@@ -80,7 +82,7 @@ select{padding:4px}
 </style></head>
 <body>
 <h2>交易策略控制台</h2>
-<div class="note"><b>运行策略固定4h:</b> EMA21/55 云图 cross（4h收线确认）入场 + MACD背离止盈；图表周期切换只影响展示。</div>
+<div class="note"><b>运行策略固定4h:</b> EMA144大趋势过滤 + EMA89趋势确认，EMA21/55云图cross（4h收线确认）入场，MACD背离止盈；图表周期切换只影响展示。</div>
 {% if msg %}<div class="msg">{{msg}}</div>{% endif %}
 
 <div class="toolbar"><b>标的:</b>
@@ -171,6 +173,70 @@ def save_signal_state(state: dict) -> None:
     save_json(SIGNAL_STATE_FILE, state)
 
 
+
+
+def init_trade_db() -> None:
+    con = sqlite3.connect(TRADE_DB_FILE)
+    try:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS execution_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                symbol TEXT,
+                signal TEXT,
+                reason TEXT,
+                entry REAL,
+                stop_loss REAL,
+                take_profit REAL,
+                extra_json TEXT
+            )
+            """
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def log_execution_event(mode: str, symbol: str | None, signal: str | None, reason: str | None, entry: float | None, sl: float | None, tp: float | None, extra: dict | None = None) -> None:
+    init_trade_db()
+    con = sqlite3.connect(TRADE_DB_FILE)
+    try:
+        con.execute(
+            """
+            INSERT INTO execution_events (ts, mode, symbol, signal, reason, entry, stop_loss, take_profit, extra_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now(CN_TZ).isoformat(),
+                mode,
+                symbol,
+                signal,
+                reason,
+                entry,
+                sl,
+                tp,
+                json.dumps(extra or {}, ensure_ascii=False),
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def append_backtest_log(line: str) -> None:
+    BACKTEST_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with BACKTEST_LOG_FILE.open("a", encoding="utf-8") as f:
+        f.write(f"{datetime.now(CN_TZ).isoformat()} {line}\n")
+
+
+def tail_backtest_log(max_lines: int = 120) -> str:
+    if not BACKTEST_LOG_FILE.exists():
+        return ""
+    return "\n".join(BACKTEST_LOG_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()[-max_lines:])
+
+
 def get_history_count() -> int:
     db = RUNTIME / "history.db"
     if not db.exists():
@@ -232,6 +298,7 @@ def fetch_full_ohlcv(symbol: str, timeframe: str = "4h") -> tuple[pd.DataFrame, 
     errors = []
     for ex_name in _resolve_exchanges():
         try:
+            append_backtest_log(f"尝试交易所数据源 {ex_name} {symbol} {timeframe}")
             ex = getattr(ccxt, ex_name)({"enableRateLimit": True})
             since, rows_all = start_since, []
             for _ in range(2500):
@@ -251,10 +318,45 @@ def fetch_full_ohlcv(symbol: str, timeframe: str = "4h") -> tuple[pd.DataFrame, 
                 raise RuntimeError("empty")
             df = pd.DataFrame(rows_all, columns=["ts", "Open", "High", "Low", "Close", "Volume"]).drop_duplicates("ts").sort_values("ts")
             df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert(CN_TZ).dt.tz_localize(None)
+            append_backtest_log(f"数据源成功 {ex_name} rows={len(df)}")
             return df, ex_name
         except Exception as e:
             errors.append(f"{ex_name}: {e}")
+            append_backtest_log(f"数据源失败 {ex_name}: {e}")
+
+    # fallback to public historical csv
+    if timeframe == "4h":
+        try:
+            append_backtest_log(f"尝试公共CSV数据源 cryptodatadownload {symbol}")
+            df = _fetch_cdd_4h(symbol)
+            append_backtest_log(f"公共CSV成功 rows={len(df)}")
+            return df, "cryptodatadownload"
+        except Exception as e:
+            errors.append(f"cryptodatadownload: {e}")
+            append_backtest_log(f"公共CSV失败: {e}")
+
     raise RuntimeError(" ; ".join(errors))
+
+
+def _fetch_cdd_4h(symbol: str) -> pd.DataFrame:
+    pair = symbol.replace("/", "")
+    url = f"https://www.cryptodatadownload.com/cdd/Binance_{pair}_4h.csv"
+    df = pd.read_csv(url, skiprows=1)
+    if "Date" not in df.columns:
+        raise RuntimeError("cdd csv format unexpected")
+    if "symbol" in df.columns:
+        d = pd.DataFrame({
+            "ts": pd.to_datetime(df["Date"], utc=True).dt.tz_convert(CN_TZ).dt.tz_localize(None),
+            "Open": df["Open"].astype(float),
+            "High": df["High"].astype(float),
+            "Low": df["Low"].astype(float),
+            "Close": df["Close"].astype(float),
+            "Volume": df.get("Volume USDT", df.get("Volume", 0)).astype(float),
+        })
+    else:
+        raise RuntimeError("cdd missing expected columns")
+    d = d.sort_values("ts").drop_duplicates("ts")
+    return d
 
 
 def _apply_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -288,17 +390,19 @@ def _apply_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _cloud_cross_signal(row: pd.Series, prev: pd.Series) -> int:
-    """EMA21/55 云图 cross + 4h 收线确认。"""
+    """EMA21/55 云图 cross + 4h 收线确认 + EMA89/144 趋势确认。"""
     bull_cross = prev["ema21"] <= prev["ema55"] and row["ema21"] > row["ema55"]
     bear_cross = prev["ema21"] >= prev["ema55"] and row["ema21"] < row["ema55"]
 
-    # 收线确认：避免影线假突破
     close_confirm_long = row["Close"] > max(row["ema21"], row["ema55"])
     close_confirm_short = row["Close"] < min(row["ema21"], row["ema55"])
 
-    if bull_cross and close_confirm_long:
+    trend_long = row["Close"] > row["ema144"] and row["ema89"] > row["ema144"]
+    trend_short = row["Close"] < row["ema144"] and row["ema89"] < row["ema144"]
+
+    if bull_cross and close_confirm_long and trend_long:
         return 1
-    if bear_cross and close_confirm_short:
+    if bear_cross and close_confirm_short and trend_short:
         return -1
     return 0
 
@@ -330,9 +434,18 @@ def build_signal_plan(df_4h_raw: pd.DataFrame) -> SignalPlan:
     entry = float(row["Close"])
     dist = max(float(row["atr14"]) * 1.2, entry * 0.004)
     if cross == 1:
-        return SignalPlan("做多", "EMA21上穿EMA55云图且4h收线确认", str(row["ts"]), entry, entry - dist, entry + dist * 1.8)
+        return SignalPlan("做多", "EMA21上穿EMA55云图 + EMA89/144确认(4h收线)", str(row["ts"]), entry, entry - dist, entry + dist * 1.8)
     if cross == -1:
-        return SignalPlan("做空", "EMA21下穿EMA55云图且4h收线确认", str(row["ts"]), entry, entry + dist, entry - dist * 1.8)
+        return SignalPlan("做空", "EMA21下穿EMA55云图 + EMA89/144确认(4h收线)", str(row["ts"]), entry, entry + dist, entry - dist * 1.8)
+
+    # 加仓信号：趋势中回踩EMA89再回到21动量
+    add_long = row["Close"] > row["ema144"] and row["ema89"] > row["ema144"] and row["Low"] <= row["ema89"] * 1.003 and row["Close"] > row["ema21"]
+    add_short = row["Close"] < row["ema144"] and row["ema89"] < row["ema144"] and row["High"] >= row["ema89"] * 0.997 and row["Close"] < row["ema21"]
+    if add_long:
+        return SignalPlan("加仓多", "回踩EMA89后动量恢复(4h)", str(row["ts"]), entry, entry - dist, entry + dist * 1.6)
+    if add_short:
+        return SignalPlan("加仓空", "反弹EMA89后动量恢复(4h)", str(row["ts"]), entry, entry + dist, entry - dist * 1.6)
+
     if div == -1:
         return SignalPlan("止盈", "4h MACD顶背离", str(row["ts"]), entry, entry, entry)
     if div == 1:
@@ -350,6 +463,7 @@ def maybe_log_signal(symbol: str, plan: SignalPlan, chart_timeframe: str, chart_
     )
     state[key] = {"signal": plan.signal, "signal_ts": plan.signal_ts, "entry": round(plan.entry, 6), "stop_loss": round(plan.stop_loss, 6), "take_profit": round(plan.take_profit, 6)}
     save_signal_state(state)
+    log_execution_event("signal", symbol, plan.signal, plan.reason, plan.entry, plan.stop_loss, plan.take_profit, {"chart_timeframe": chart_timeframe, "chart_exchange": chart_ex, "signal_exchange": sig_ex, "price": price})
 
 
 def _simulate_trades(df: pd.DataFrame, signal_fn, stop_mult: float, hold_max: int, bull_set: set[int], bear_set: set[int], fee: float = 0.0008) -> List[float]:
@@ -475,7 +589,7 @@ def _strategy_signal_factory(name: str):
             return -1
         return 0
 
-    return {"ema_cross_89_144_169": sig_ema, "multi_confluence": sig_confluence, "volume_breakout": sig_breakout}[name]
+    return {"ema_channel_4h_primary": sig_ema, "multi_confluence": sig_confluence, "volume_breakout": sig_breakout}[name]
 
 
 def _profile_grid(profile: str):
@@ -485,7 +599,7 @@ def _profile_grid(profile: str):
 
 
 def _backtest_engine(df: pd.DataFrame, profile: str) -> dict:
-    strategies = ["ema_cross_89_144_169", "multi_confluence", "volume_breakout"]
+    strategies = ["ema_channel_4h_primary", "multi_confluence", "volume_breakout"]
     grid = _profile_grid(profile)
     out = {}
     bull_div, bear_div = _macd_divergence_points(df, lookback=60)
@@ -535,18 +649,26 @@ def _analyze_symbol(symbol: str, profile: str) -> dict:
 
 def _run_backtest_job(symbol_choice: str, profile: str) -> None:
     save_json(BACKTEST_STATUS_FILE, {"running": True, "status": "running", "stage": f"start {symbol_choice}/{profile}", "updated_at": datetime.now(CN_TZ).isoformat()})
+    append_backtest_log(f"start symbol={symbol_choice} profile={profile}")
+    log_execution_event("backtest_start", symbol_choice, None, f"profile={profile}", None, None, None, None)
     try:
         syms = ["BTC/USDT", "ETH/USDT"] if symbol_choice == "BOTH" else [symbol_choice]
         report = {"generated_at_cn": datetime.now(CN_TZ).isoformat(), "profile": profile, "signal_timeframe": "4h", "symbols": {}}
         for s in syms:
             save_json(BACKTEST_STATUS_FILE, {"running": True, "status": "running", "stage": f"analyzing {s}", "updated_at": datetime.now(CN_TZ).isoformat()})
+            append_backtest_log(f"analyzing {s}")
             report["symbols"][s] = _analyze_symbol(s, profile)
+            log_execution_event("backtest_symbol_done", s, None, "analysis_done", None, None, None, {"rows": report["symbols"][s].get("rows", 0), "best": report["symbols"][s].get("engine", {}).get("best", {})})
         save_json(BACKTEST_REPORT_FILE, report)
         BACKTEST_REPORT_MD_FILE.write_text(_render_report_md(report), encoding="utf-8")
-        save_json(BACKTEST_STATUS_FILE, {"running": False, "status": "done", "stage": "完成", "report_file": str(BACKTEST_REPORT_FILE), "report_md_file": str(BACKTEST_REPORT_MD_FILE), "updated_at": datetime.now(CN_TZ).isoformat()})
+        save_json(BACKTEST_STATUS_FILE, {"running": False, "status": "done", "stage": "完成", "report_file": str(BACKTEST_REPORT_FILE), "report_md_file": str(BACKTEST_REPORT_MD_FILE), "backtest_log_file": str(BACKTEST_LOG_FILE), "updated_at": datetime.now(CN_TZ).isoformat()})
+        append_backtest_log("finished successfully")
+        log_execution_event("backtest_done", symbol_choice, None, "done", None, None, None, {"profile": profile})
         append_live_log("全历史回测完成")
     except Exception as e:
-        save_json(BACKTEST_STATUS_FILE, {"running": False, "status": "failed", "stage": "异常", "error": str(e), "updated_at": datetime.now(CN_TZ).isoformat()})
+        append_backtest_log(f"failed: {e}")
+        save_json(BACKTEST_STATUS_FILE, {"running": False, "status": "failed", "stage": "异常", "error": str(e), "backtest_log_file": str(BACKTEST_LOG_FILE), "updated_at": datetime.now(CN_TZ).isoformat()})
+        log_execution_event("backtest_failed", symbol_choice, None, str(e), None, None, None, {"profile": profile})
         append_live_log(f"回测失败: {e}")
 
 
@@ -580,6 +702,7 @@ def api_backtest_status():
     s = load_json(BACKTEST_STATUS_FILE, {"running": False, "status": "idle", "updated_at": None})
     if BACKTEST_REPORT_FILE.exists(): s["report"] = load_json(BACKTEST_REPORT_FILE, {})
     if BACKTEST_REPORT_MD_FILE.exists(): s["report_markdown"] = BACKTEST_REPORT_MD_FILE.read_text(encoding="utf-8")
+    s["backtest_log_tail"] = tail_backtest_log()
     return jsonify(s)
 
 
@@ -594,6 +717,15 @@ def run_backtest():
     selected = request.form.get("backtest_symbol", "BOTH"); profile = request.form.get("profile", "deep")
     if selected not in {"BTC/USDT", "ETH/USDT", "BOTH"}: selected = "BOTH"
     if profile not in {"standard", "deep"}: profile = "deep"
+
+    # 清理旧回测输出，避免显示历史脏数据
+    for f in [BACKTEST_REPORT_FILE, BACKTEST_REPORT_MD_FILE, BACKTEST_LOG_FILE]:
+        if f.exists():
+            f.unlink()
+
+    run_id = datetime.now(CN_TZ).strftime("%Y%m%d_%H%M%S")
+    save_json(BACKTEST_STATUS_FILE, {"running": True, "status": "running", "stage": "queued", "run_id": run_id, "updated_at": datetime.now(CN_TZ).isoformat()})
+    append_backtest_log(f"run_id={run_id} queued symbol={selected} profile={profile}")
 
     global BACKTEST_THREAD
     with BACKTEST_LOCK:
@@ -653,7 +785,7 @@ def chart():
 
         cp = float(di.iloc[-1]["Close"])
         fig.add_hline(y=cp, line_dash="dot", line_color="#f7b500", annotation_text=f"当前价:{cp:.2f}", row=1, col=1)
-        if plan.signal in {"做多", "做空", "止盈"}:
+        if plan.signal in {"做多", "做空", "止盈", "加仓多", "加仓空"}:
             fig.add_hline(y=plan.stop_loss, line_dash="dash", line_color="#ff4d4f", annotation_text="止损", row=1, col=1)
             fig.add_hline(y=plan.take_profit, line_dash="dash", line_color="#00c853", annotation_text="止盈", row=1, col=1)
 

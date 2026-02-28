@@ -10,6 +10,7 @@ set "UI_URL=http://%UI_HOST%:%UI_PORT%"
 set "LOG_DIR=runtime"
 set "DEPLOY_LOG=%LOG_DIR%\one_click_deploy.log"
 set "UI_LOG=%LOG_DIR%\ui_server.log"
+set "UI_ERR_LOG=%LOG_DIR%\ui_server.err.log"
 set "VENV_PYTHON=.venv\Scripts\python.exe"
 
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
@@ -18,9 +19,11 @@ echo ==================================================>"%DEPLOY_LOG%"
 echo [%date% %time%] one_click_deploy start >>"%DEPLOY_LOG%"
 echo UI_URL=%UI_URL% >>"%DEPLOY_LOG%"
 if exist "%UI_LOG%" del /q "%UI_LOG%"
+if exist "%UI_ERR_LOG%" del /q "%UI_ERR_LOG%"
 
 echo [INFO] Deploy log: %DEPLOY_LOG%
 echo [INFO] UI log: %UI_LOG%
+echo [INFO] UI err log: %UI_ERR_LOG%
 
 echo [STEP] 1/5 Setup environment...
 echo [%date% %time%] STEP1 setup_env begin >>"%DEPLOY_LOG%"
@@ -101,7 +104,7 @@ if not "%RC%"=="0" goto :fail_ui_check
 
 echo [STEP] 4/5 Start UI process...
 echo [%date% %time%] STEP4 start ui process begin >>"%DEPLOY_LOG%"
-powershell -NoProfile -Command "$p=Start-Process -FilePath '%VENV_PYTHON%' -ArgumentList '-u','ui_app.py' -WorkingDirectory '.' -RedirectStandardOutput '%UI_LOG%' -RedirectStandardError '%UI_LOG%' -PassThru; if($p){ Write-Output ('UI_PID=' + $p.Id); exit 0 } else { exit 1 }" >>"%DEPLOY_LOG%" 2>&1
+powershell -NoProfile -Command "$p=Start-Process -FilePath '%VENV_PYTHON%' -ArgumentList '-u','ui_app.py' -WorkingDirectory '.' -RedirectStandardOutput '%UI_LOG%' -RedirectStandardError '%UI_ERR_LOG%' -PassThru; if($p){ Write-Output ('UI_PID=' + $p.Id); exit 0 } else { exit 1 }" >>"%DEPLOY_LOG%" 2>&1
 set "RC=%ERRORLEVEL%"
 echo [%date% %time%] STEP4 start rc=%RC% >>"%DEPLOY_LOG%"
 if not "%RC%"=="0" goto :fail_ui_check
@@ -128,10 +131,15 @@ echo [WARN] %DEPLOY_LOG%
 echo [TIP] Run diagnose_ui.bat for one-click diagnostics.
 echo [%date% %time%] WARN ui not ready in timeout window >>"%DEPLOY_LOG%"
 if exist "%UI_LOG%" powershell -NoProfile -Command "Get-Content -Encoding UTF8 -Tail 120 '%UI_LOG%'" >>"%DEPLOY_LOG%" 2>&1
+if exist "%UI_ERR_LOG%" powershell -NoProfile -Command "Get-Content -Encoding UTF8 -Tail 120 '%UI_ERR_LOG%'" >>"%DEPLOY_LOG%" 2>&1
 tasklist | findstr /I "python.exe" >>"%DEPLOY_LOG%" 2>&1
 if exist "%UI_LOG%" (
   echo -------- ui_server.log tail 60 --------
   powershell -NoProfile -Command "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; Get-Content -Encoding UTF8 -Tail 60 '%UI_LOG%'"
+)
+if exist "%UI_ERR_LOG%" (
+  echo -------- ui_server.err.log tail 60 --------
+  powershell -NoProfile -Command "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; Get-Content -Encoding UTF8 -Tail 60 '%UI_ERR_LOG%'"
 )
 start "Strategy UI" %UI_URL%
 goto :done

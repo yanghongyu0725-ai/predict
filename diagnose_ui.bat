@@ -8,6 +8,7 @@ set PYTHONIOENCODING=utf-8
 set LOG_DIR=runtime
 set DEPLOY_LOG=%LOG_DIR%\one_click_deploy.log
 set UI_LOG=%LOG_DIR%\ui_server.log
+set UI_ERR_LOG=%LOG_DIR%\ui_server.err.log
 set UI_DEBUG_LOG=%LOG_DIR%\ui_app_debug.log
 set LIVE_LOG=%LOG_DIR%\ui_live.log
 set UI_PORT=8501
@@ -49,6 +50,7 @@ echo.
 echo [5] 日志文件路径
 echo DEPLOY_LOG=%DEPLOY_LOG%
 echo UI_LOG=%UI_LOG%
+echo UI_ERR_LOG=%UI_ERR_LOG%
 echo UI_DEBUG_LOG=%UI_DEBUG_LOG%
 echo LIVE_LOG=%LIVE_LOG%
 
@@ -66,6 +68,14 @@ if exist %UI_LOG% (
   powershell -NoProfile -Command "Get-Content -Encoding UTF8 -Tail 80 '%UI_LOG%'"
 ) else (
   echo [WARN] 未找到 %UI_LOG%
+)
+
+echo.
+if exist %UI_ERR_LOG% (
+  echo ===== ui_server.err.log (tail 80) =====
+  powershell -NoProfile -Command "Get-Content -Encoding UTF8 -Tail 80 '%UI_ERR_LOG%'"
+) else (
+  echo [WARN] 未找到 %UI_ERR_LOG%
 )
 
 echo.

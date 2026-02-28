@@ -104,7 +104,17 @@ if not "%RC%"=="0" goto :fail_ui_check
 
 echo [STEP] 4/5 Start UI process...
 echo [%date% %time%] STEP4 start ui process begin >>"%DEPLOY_LOG%"
-powershell -NoProfile -Command "$p=Start-Process -FilePath '%VENV_PYTHON%' -ArgumentList '-u','ui_app.py' -WorkingDirectory '.' -RedirectStandardOutput '%UI_LOG%' -RedirectStandardError '%UI_ERR_LOG%' -PassThru; if($p){ Write-Output ('UI_PID=' + $p.Id); exit 0 } else { exit 1 }" >>"%DEPLOY_LOG%" 2>&1
+set "UI_LAUNCHER=%LOG_DIR%\launch_ui_server.bat"
+(
+  echo @echo off
+  echo chcp 65001 ^>nul
+  echo set PYTHONUTF8=1
+  echo set PYTHONIOENCODING=utf-8
+  echo cd /d "%%~dp0.."
+  echo call .venv\Scripts\activate.bat
+  echo "%VENV_PYTHON%" -u ui_app.py 1^>^>"%UI_LOG%" 2^>^>"%UI_ERR_LOG%"
+) > "%UI_LAUNCHER%"
+start "Strategy UI Server" "%UI_LAUNCHER%"
 set "RC=%ERRORLEVEL%"
 echo [%date% %time%] STEP4 start rc=%RC% >>"%DEPLOY_LOG%"
 if not "%RC%"=="0" goto :fail_ui_check

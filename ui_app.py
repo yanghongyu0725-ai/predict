@@ -80,7 +80,7 @@ select{padding:4px}
 </style></head>
 <body>
 <h2>交易策略控制台</h2>
-<div class="note"><b>运行策略固定4h:</b> EMA89/144/169 Cross入场 + MACD背离止盈；图表周期切换只影响展示。</div>
+<div class="note"><b>运行策略固定4h:</b> EMA21/55 云图 cross（4h收线确认）入场 + MACD背离止盈；图表周期切换只影响展示。</div>
 {% if msg %}<div class="msg">{{msg}}</div>{% endif %}
 
 <div class="toolbar"><b>标的:</b>
@@ -287,40 +287,18 @@ def _apply_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
-def _trend_state(row: pd.Series, prev: pd.Series) -> int:
-    up = (
-        row["Close"] > row["ema144"]
-        and row["ema55"] > row["ema89"] > row["ema144"]
-        and row["ema55"] > prev["ema55"]
-        and row["ema89"] > prev["ema89"]
-        and row["ema144"] > prev["ema144"]
-    )
-    down = (
-        row["Close"] < row["ema144"]
-        and row["ema55"] < row["ema89"] < row["ema144"]
-        and row["ema55"] < prev["ema55"]
-        and row["ema89"] < prev["ema89"]
-        and row["ema144"] < prev["ema144"]
-    )
-    return 1 if up else -1 if down else 0
+def _cloud_cross_signal(row: pd.Series, prev: pd.Series) -> int:
+    """EMA21/55 云图 cross + 4h 收线确认。"""
+    bull_cross = prev["ema21"] <= prev["ema55"] and row["ema21"] > row["ema55"]
+    bear_cross = prev["ema21"] >= prev["ema55"] and row["ema21"] < row["ema55"]
 
+    # 收线确认：避免影线假突破
+    close_confirm_long = row["Close"] > max(row["ema21"], row["ema55"])
+    close_confirm_short = row["Close"] < min(row["ema21"], row["ema55"])
 
-def _ema_channel_signal(row: pd.Series, prev: pd.Series) -> int:
-    trend = _trend_state(row, prev)
-    if trend == 0:
-        return 0
-
-    # 回踩55后确认回到21上/下（4h收盘）
-    touched_55_long = row["Low"] <= row["ema55"] * 1.002
-    touched_55_short = row["High"] >= row["ema55"] * 0.998
-    vol_shrink = row["Volume"] <= prev["Volume"] * 1.1
-
-    long_confirm = prev["Close"] <= prev["ema21"] and row["Close"] > row["ema21"]
-    short_confirm = prev["Close"] >= prev["ema21"] and row["Close"] < row["ema21"]
-
-    if trend == 1 and touched_55_long and long_confirm and vol_shrink:
+    if bull_cross and close_confirm_long:
         return 1
-    if trend == -1 and touched_55_short and short_confirm and vol_shrink:
+    if bear_cross and close_confirm_short:
         return -1
     return 0
 
@@ -345,16 +323,16 @@ def _macd_divergence_points(df: pd.DataFrame, lookback: int = 60) -> Tuple[List[
 def build_signal_plan(df_4h_raw: pd.DataFrame) -> SignalPlan:
     d = _apply_indicators(df_4h_raw)
     row, prev = d.iloc[-2], d.iloc[-3]  # 已收盘4h
-    cross = _ema_channel_signal(row, prev)
+    cross = _cloud_cross_signal(row, prev)
     bull_div, bear_div = _macd_divergence_points(d, lookback=60)
     idx = len(d) - 2
     div = -1 if idx in set(bear_div) else 1 if idx in set(bull_div) else 0
     entry = float(row["Close"])
     dist = max(float(row["atr14"]) * 1.2, entry * 0.004)
     if cross == 1:
-        return SignalPlan("做多", "EMA21/55/89/144 多头通道回踩55后重回21(4h确认)", str(row["ts"]), entry, entry - dist, entry + dist * 1.8)
+        return SignalPlan("做多", "EMA21上穿EMA55云图且4h收线确认", str(row["ts"]), entry, entry - dist, entry + dist * 1.8)
     if cross == -1:
-        return SignalPlan("做空", "EMA21/55/89/144 空头通道反弹55后跌回21(4h确认)", str(row["ts"]), entry, entry + dist, entry - dist * 1.8)
+        return SignalPlan("做空", "EMA21下穿EMA55云图且4h收线确认", str(row["ts"]), entry, entry + dist, entry - dist * 1.8)
     if div == -1:
         return SignalPlan("止盈", "4h MACD顶背离", str(row["ts"]), entry, entry, entry)
     if div == 1:
@@ -480,10 +458,10 @@ def _recommend_leverage_and_margin(exposure: float) -> tuple[float, float]:
 
 def _strategy_signal_factory(name: str):
     def sig_ema(df, i, row, prev):
-        return _ema_channel_signal(row, prev)
+        return _cloud_cross_signal(row, prev)
 
     def sig_confluence(df, i, row, prev):
-        ema_trend = 1 if row["ema21"] > row["ema55"] > row["ema89"] else -1 if row["ema21"] < row["ema55"] < row["ema89"] else 0
+        ema_trend = 1 if row["ema21"] > row["ema55"] and row["Close"] > row["ema89"] > row["ema144"] else -1 if row["ema21"] < row["ema55"] and row["Close"] < row["ema89"] < row["ema144"] else 0
         macd = 1 if row["macd_hist"] > 0 else -1 if row["macd_hist"] < 0 else 0
         rsi = 1 if row["rsi14"] > 55 else -1 if row["rsi14"] < 45 else 0
         vol = 1 if row["vol_ratio"] > 1.2 and row["obv"] > row["obv_ema20"] else -1 if row["vol_ratio"] > 1.2 and row["obv"] < row["obv_ema20"] else 0
@@ -659,10 +637,10 @@ def chart():
 
         fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.62, 0.20, 0.18], vertical_spacing=0.03)
         fig.add_trace(go.Candlestick(x=di["ts"], open=di["Open"], high=di["High"], low=di["Low"], close=di["Close"], name=f"{symbol} {tf}"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=di["ts"], y=di["ema21"], name="EMA21", line=dict(color="#ffffff", width=1.4)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=di["ts"], y=di["ema89"], name="EMA89", line=dict(color="#00b0ff", width=1.4)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=di["ts"], y=di["ema55"], name="EMA55", line=dict(color="rgba(255,193,7,0.8)", width=0.8)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=di["ts"], y=di["ema144"], name="EMA144", line=dict(color="rgba(255,152,0,0.8)", width=0.8), fill="tonexty", fillcolor="rgba(255,193,7,0.18)"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=di["ts"], y=di["ema89"], name="EMA89", line=dict(color="#ffffff", width=1.6)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=di["ts"], y=di["ema144"], name="EMA144", line=dict(color="#b388ff", width=1.6)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=di["ts"], y=di["ema21"], name="EMA21", line=dict(color="rgba(0,230,118,0.9)", width=1.0)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=di["ts"], y=di["ema55"], name="EMA55", line=dict(color="rgba(0,188,212,0.9)", width=1.0), fill="tonexty", fillcolor="rgba(0,188,212,0.18)"), row=1, col=1)
         fig.add_trace(go.Bar(x=di["ts"], y=di["Volume"], name="VOL", marker_color="#888"), row=2, col=1)
         fig.add_trace(go.Scatter(x=di["ts"], y=di["macd"], name="MACD", line=dict(color="#00bcd4", width=1.2)), row=3, col=1)
         fig.add_trace(go.Scatter(x=di["ts"], y=di["macd_signal"], name="MACD_SIGNAL", line=dict(color="#ff9800", width=1.0)), row=3, col=1)

@@ -24,12 +24,16 @@ echo [INFO] UI log: %UI_LOG%
 echo [STEP] 1/5 Setup environment...
 echo [%date% %time%] STEP1 setup_env begin >>"%DEPLOY_LOG%"
 call setup_env.bat
-if errorlevel 1 goto :fail_setup
+set "RC=%ERRORLEVEL%"
+echo [%date% %time%] STEP1 setup_env rc=%RC% >>"%DEPLOY_LOG%"
+if not "%RC%"=="0" goto :fail_setup
 
 echo [STEP] 2/5 Activate virtual env...
 echo [%date% %time%] STEP2 activate begin >>"%DEPLOY_LOG%"
 call .venv\Scripts\activate.bat
-if errorlevel 1 goto :fail_activate
+set "RC=%ERRORLEVEL%"
+echo [%date% %time%] STEP2 activate rc=%RC% >>"%DEPLOY_LOG%"
+if not "%RC%"=="0" goto :fail_activate
 
 if not exist "%VENV_PYTHON%" goto :fail_missing_venv_python
 
@@ -40,11 +44,10 @@ echo [INFO] Python in use: %VENV_PYTHON%
 echo [STEP] 3/5 Check dependencies...
 echo [%date% %time%] STEP3 check_env(ui) begin >>"%DEPLOY_LOG%"
 "%VENV_PYTHON%" scripts/check_env.py --mode ui
-if errorlevel 1 goto :repair_ui
+set "RC=%ERRORLEVEL%"
+echo [%date% %time%] STEP3 check_env(ui) rc=%RC% >>"%DEPLOY_LOG%"
+if "%RC%"=="0" goto :check_full
 
-goto :check_full
-
-:repair_ui
 echo [WARN] UI dependency check failed, start repair...
 echo [%date% %time%] WARN check_env(ui) failed, start repair >>"%DEPLOY_LOG%"
 "%VENV_PYTHON%" -m pip install -r requirements.txt >>"%DEPLOY_LOG%" 2>&1
@@ -53,43 +56,54 @@ echo [%date% %time%] WARN check_env(ui) failed, start repair >>"%DEPLOY_LOG%"
 "%VENV_PYTHON%" -m pip show python-dateutil >>"%DEPLOY_LOG%" 2>&1
 "%VENV_PYTHON%" -c "import dateutil,sys;print('dateutil_ok',dateutil.__file__,sys.executable)" >>"%DEPLOY_LOG%" 2>&1
 "%VENV_PYTHON%" scripts/check_env.py --mode ui >>"%DEPLOY_LOG%" 2>&1
-if errorlevel 1 goto :recreate_venv
+set "RC=%ERRORLEVEL%"
+echo [%date% %time%] STEP3 repair ui-check rc=%RC% >>"%DEPLOY_LOG%"
+if "%RC%"=="0" goto :check_full
 
-goto :check_full
-
-:recreate_venv
 echo [WARN] UI deps still broken, recreating virtual env...
 echo [%date% %time%] WARN recreate venv because dateutil still broken >>"%DEPLOY_LOG%"
 if exist ".venv" rmdir /s /q ".venv"
 python -m venv .venv >>"%DEPLOY_LOG%" 2>&1
-if errorlevel 1 goto :fail_recreate_venv
+set "RC=%ERRORLEVEL%"
+echo [%date% %time%] STEP3 recreate venv rc=%RC% >>"%DEPLOY_LOG%"
+if not "%RC%"=="0" goto :fail_recreate_venv
+
 call .venv\Scripts\activate.bat
-if errorlevel 1 goto :fail_activate
+set "RC=%ERRORLEVEL%"
+echo [%date% %time%] STEP3 re-activate rc=%RC% >>"%DEPLOY_LOG%"
+if not "%RC%"=="0" goto :fail_activate
+
 set "VENV_PYTHON=.venv\Scripts\python.exe"
 "%VENV_PYTHON%" -m pip install --upgrade pip >>"%DEPLOY_LOG%" 2>&1
 "%VENV_PYTHON%" -m pip install -r requirements.txt >>"%DEPLOY_LOG%" 2>&1
 "%VENV_PYTHON%" scripts/check_env.py --mode ui >>"%DEPLOY_LOG%" 2>&1
-if errorlevel 1 goto :fail_ui_check
+set "RC=%ERRORLEVEL%"
+echo [%date% %time%] STEP3 recreate ui-check rc=%RC% >>"%DEPLOY_LOG%"
+if not "%RC%"=="0" goto :fail_ui_check
 
 :check_full
 echo [%date% %time%] STEP3 check_env(full) begin >>"%DEPLOY_LOG%"
 "%VENV_PYTHON%" scripts/check_env.py --mode full >>"%DEPLOY_LOG%" 2>&1
-if errorlevel 1 (
-  echo [WARN] Full strategy dependency check failed (UI can still start; strategy run may fail).
-  echo [%date% %time%] WARN check_env(full) failed; continue for UI only >>"%DEPLOY_LOG%"
-)
+set "RC=%ERRORLEVEL%"
+echo [%date% %time%] STEP3 check_env(full) rc=%RC% >>"%DEPLOY_LOG%"
+if "%RC%"=="0" goto :ui_import_check
 
+echo [WARN] Full strategy dependency check failed (UI can still start; strategy run may fail).
+echo [%date% %time%] WARN check_env(full) failed; continue for UI only >>"%DEPLOY_LOG%"
+
+:ui_import_check
 echo [%date% %time%] STEP3 ui-import-check begin >>"%DEPLOY_LOG%"
 "%VENV_PYTHON%" -c "import flask,ccxt,pandas,plotly,dateutil;print('ui-import-check-ok')" >>"%DEPLOY_LOG%" 2>&1
-if errorlevel 1 goto :fail_ui_check
+set "RC=%ERRORLEVEL%"
+echo [%date% %time%] STEP3 ui-import-check rc=%RC% >>"%DEPLOY_LOG%"
+if not "%RC%"=="0" goto :fail_ui_check
 
 echo [STEP] 4/5 Start UI process...
-echo [%date% %time%] starting ui server >>"%DEPLOY_LOG%"
-start "Strategy UI Server" cmd /c ""%VENV_PYTHON%" ui_app.py 1>>"%UI_LOG%" 2>&1"
-if errorlevel 1 (
-  echo [ERROR] failed to launch UI server process. >>"%DEPLOY_LOG%"
-  goto :fail_ui_check
-)
+echo [%date% %time%] STEP4 start ui process begin >>"%DEPLOY_LOG%"
+start "Strategy UI Server" "%VENV_PYTHON%" ui_app.py
+set "RC=%ERRORLEVEL%"
+echo [%date% %time%] STEP4 start rc=%RC% >>"%DEPLOY_LOG%"
+if not "%RC%"=="0" goto :fail_ui_check
 
 echo [STEP] 5/5 Check UI health and open browser...
 echo [%date% %time%] STEP5 healthcheck begin >>"%DEPLOY_LOG%"
@@ -139,9 +153,9 @@ echo [%date% %time%] ERROR recreate venv failed >>"%DEPLOY_LOG%"
 goto :exit_fail
 
 :fail_ui_check
-echo [ERROR] UI dependency check still failed.
+echo [ERROR] UI dependency/process check failed.
 echo [ERROR] Try: .venv\Scripts\python.exe -m pip install --no-cache-dir --force-reinstall python-dateutil pandas
-echo [%date% %time%] ERROR ui dependency check failed >>"%DEPLOY_LOG%"
+echo [%date% %time%] ERROR ui dependency/process check failed >>"%DEPLOY_LOG%"
 goto :exit_fail
 
 :exit_fail

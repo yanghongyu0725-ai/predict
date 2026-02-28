@@ -10,12 +10,14 @@ import sys
 import threading
 import time
 import traceback
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 from zoneinfo import ZoneInfo
 
 import ccxt
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from flask import Flask, jsonify, redirect, render_template_string, request, send_file, url_for
@@ -33,35 +35,42 @@ BACKTEST_REPORT_FILE = RUNTIME / "backtest_report.json"
 BACKTEST_REPORT_MD_FILE = RUNTIME / "backtest_report.md"
 
 CN_TZ = ZoneInfo("Asia/Shanghai")
+SIGNAL_TIMEFRAME = "4h"  # 运行信号固定4h，与图表周期隔离
 
 RUNTIME.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[
-        logging.FileHandler(UI_DEBUG_LOG, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=[logging.FileHandler(UI_DEBUG_LOG, encoding="utf-8"), logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("ui_app")
-logger.info("UI app module initialized")
 
 SYMBOLS = ["BTC/USDT", "ETH/USDT"]
 TIMEFRAMES = ["1m", "15m", "1h", "4h", "1d", "1w"]
-SIGNAL_TIMEFRAME = "4h"
 EXCHANGES = ["bybit", "okx", "binance"]
 MARKET_CACHE: Dict[Tuple[str, str, int], Dict] = {}
 BACKTEST_LOCK = threading.Lock()
 BACKTEST_THREAD: threading.Thread | None = None
+
+
+@dataclass
+class SignalPlan:
+    signal: str
+    reason: str
+    signal_ts: str
+    entry: float
+    stop_loss: float
+    take_profit: float
+
 
 HTML = """
 <!doctype html><html><head><meta charset='utf-8'><title>策略控制台</title>
 <style>
 body{font-family:Arial;margin:20px}
 button{margin:4px;padding:8px 12px}
-pre{background:#111;color:#0f0;padding:10px;white-space:pre-wrap;max-height:360px;overflow:auto}
+pre{background:#111;color:#0f0;padding:10px;white-space:pre-wrap;max-height:380px;overflow:auto}
 .msg{padding:8px 12px;background:#eef;border:1px solid #99c;margin-bottom:10px}
-iframe{width:100%;height:680px;border:1px solid #ddd}
+iframe{width:100%;height:760px;border:1px solid #ddd}
 .toolbar{margin-bottom:8px}
 .pill{display:inline-block;padding:6px 10px;margin:2px;border:1px solid #aaa;border-radius:6px;text-decoration:none;color:#000}
 .pill.active{background:#333;color:#fff}
@@ -71,24 +80,18 @@ select{padding:4px}
 </style></head>
 <body>
 <h2>交易策略控制台</h2>
-<div class="note"><b>策略信号固定周期:</b> 4h（图表切换仅影响展示，不影响策略信号）</div>
+<div class="note"><b>运行策略固定4h:</b> EMA89/144/169 Cross入场 + MACD背离止盈；图表周期切换只影响展示。</div>
 {% if msg %}<div class="msg">{{msg}}</div>{% endif %}
 
-<div class="toolbar">
-  <b>标的:</b>
-  {% for s in symbols %}
-    <a class="pill {% if s==symbol %}active{% endif %}" href="/?symbol={{s}}&timeframe={{timeframe}}">{{s}}</a>
-  {% endfor %}
+<div class="toolbar"><b>标的:</b>
+{% for s in symbols %}<a class="pill {% if s==symbol %}active{% endif %}" href="/?symbol={{s}}&timeframe={{timeframe}}">{{s}}</a>{% endfor %}
 </div>
-<div class="toolbar">
-  <b>图表周期:</b>
-  {% for tf in timeframes %}
-    <a class="pill {% if tf==timeframe %}active{% endif %}" href="/?symbol={{symbol}}&timeframe={{tf}}">{{tf}}</a>
-  {% endfor %}
+<div class="toolbar"><b>图表周期:</b>
+{% for tf in timeframes %}<a class="pill {% if tf==timeframe %}active{% endif %}" href="/?symbol={{symbol}}&timeframe={{tf}}">{{tf}}</a>{% endfor %}
 </div>
 
 <div class="panel">
-  <h3>长周期回测分析（4h，全历史）</h3>
+  <h3>全历史4h回测（多指标 + 仓位管理优化）</h3>
   <form method='post' action='/run_backtest?symbol={{symbol}}&timeframe={{timeframe}}'>
     <label>回测标的：</label>
     <select name="backtest_symbol">
@@ -97,129 +100,75 @@ select{padding:4px}
       <option value="BOTH" selected>BTC + ETH</option>
     </select>
     <label>分析强度：</label>
-    <select name="profile">
-      <option value="standard">standard</option>
-      <option value="deep" selected>deep（参数网格更多，速度更慢）</option>
-    </select>
-    <button>启动全历史回测分析</button>
+    <select name="profile"><option value="standard">standard</option><option value="deep" selected>deep</option></select>
+    <button>启动全历史回测</button>
   </form>
   <pre id="backtest_status">加载中...</pre>
 </div>
 
-<h3>K线图（实时，增强交互）</h3>
+<h3>K线图（带 EMA/MACD/VOL）</h3>
 <iframe src="/chart?symbol={{symbol}}&timeframe={{timeframe}}"></iframe>
 
-<form method='post' action='/start_once?symbol={{symbol}}&timeframe={{timeframe}}'><button>运行一次策略（固定4h）</button></form>
-<form method='post' action='/start_daemon?symbol={{symbol}}&timeframe={{timeframe}}'><button>开启持续测试(daemon, 固定4h)</button></form>
-<form method='post' action='/start_auto?symbol={{symbol}}&timeframe={{timeframe}}'><button>开启自动下单(daemon, 固定4h)</button></form>
+<form method='post' action='/start_auto?symbol={{symbol}}&timeframe={{timeframe}}'><button>开启自动下单(固定4h信号)</button></form>
 <form method='post' action='/stop_all?symbol={{symbol}}&timeframe={{timeframe}}'><button>停止后台任务</button></form>
 
-<h3>实时状态（每10秒刷新）</h3>
-<pre id="live_status">加载中...</pre>
-
+<h3>实时状态</h3><pre id="live_status">加载中...</pre>
 <h3>历史记录条数: {{history_count}}</h3>
-<h3>最新信号/持仓/策略统计</h3>
 <pre>{{payload}}</pre>
-
-<h3>实时日志窗口</h3>
-<pre id="live_log">{{live_log}}</pre>
+<h3>实时日志</h3><pre id="live_log">{{live_log}}</pre>
 
 <script>
 async function refreshLive(){
-  const symbol = {{ symbol|tojson }};
-  const timeframe = {{ timeframe|tojson }};
-  const r = await fetch(`/api/market_status?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}`);
-  const data = await r.json();
-  document.getElementById('live_status').textContent = JSON.stringify(data, null, 2);
-
-  const l = await fetch('/api/live_log_tail');
-  const txt = await l.text();
-  document.getElementById('live_log').textContent = txt;
-
-  const b = await fetch('/api/backtest_status');
-  const backtestData = await b.json();
-  document.getElementById('backtest_status').textContent = JSON.stringify(backtestData, null, 2);
+  const symbol = {{ symbol|tojson }}; const timeframe = {{ timeframe|tojson }};
+  const s = await (await fetch(`/api/market_status?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}`)).json();
+  document.getElementById('live_status').textContent = JSON.stringify(s, null, 2);
+  document.getElementById('live_log').textContent = await (await fetch('/api/live_log_tail')).text();
+  document.getElementById('backtest_status').textContent = JSON.stringify(await (await fetch('/api/backtest_status')).json(), null, 2);
 }
-refreshLive();
-setInterval(refreshLive, 10000);
-</script>
-</body></html>
+refreshLive(); setInterval(refreshLive, 10000);
+</script></body></html>
 """
 
 
-def load_pids() -> dict:
-    if not PIDS.exists():
-        return {}
-    return json.loads(PIDS.read_text(encoding="utf-8"))
+def load_json(path: Path, default: dict) -> dict:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
 
 
-def save_pids(data: dict) -> None:
-    PIDS.parent.mkdir(parents=True, exist_ok=True)
-    PIDS.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+def save_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def append_live_log(line: str) -> None:
-    LIVE_LOG.parent.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
     with LIVE_LOG.open("a", encoding="utf-8") as f:
-        f.write(f"{ts} {line}\n")
+        f.write(f"{datetime.now(CN_TZ).isoformat()} {line}\n")
 
 
-def tail_live_log(max_lines: int = 80) -> str:
+def tail_live_log(max_lines: int = 120) -> str:
     if not LIVE_LOG.exists():
         return "暂无实时日志"
-    lines = LIVE_LOG.read_text(encoding="utf-8", errors="ignore").splitlines()
-    return "\n".join(lines[-max_lines:])
+    return "\n".join(LIVE_LOG.read_text(encoding="utf-8", errors="ignore").splitlines()[-max_lines:])
+
+
+def load_pids() -> dict:
+    return load_json(PIDS, {})
+
+
+def save_pids(data: dict) -> None:
+    save_json(PIDS, data)
 
 
 def load_signal_state() -> dict:
-    if not SIGNAL_STATE_FILE.exists():
-        return {}
-    try:
-        return json.loads(SIGNAL_STATE_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return load_json(SIGNAL_STATE_FILE, {})
 
 
 def save_signal_state(state: dict) -> None:
-    SIGNAL_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SIGNAL_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def load_backtest_status() -> dict:
-    if not BACKTEST_STATUS_FILE.exists():
-        return {"running": False, "status": "idle", "updated_at": None}
-    try:
-        return json.loads(BACKTEST_STATUS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {"running": False, "status": "status_file_corrupted", "updated_at": None}
-
-
-def save_backtest_status(payload: dict) -> None:
-    payload["updated_at"] = datetime.now(CN_TZ).isoformat()
-    BACKTEST_STATUS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def maybe_log_signal(symbol: str, plan: dict, chart_timeframe: str, chart_ex: str, sig_ex: str, price: float) -> None:
-    state = load_signal_state()
-    key = f"{symbol}:{SIGNAL_TIMEFRAME}"
-    current = {
-        "signal": plan["signal"],
-        "signal_ts": str(plan["signal_ts"]),
-        "entry": round(float(plan["entry"]), 6),
-        "stop_loss": round(float(plan["stop_loss"]), 6),
-        "take_profit": round(float(plan["take_profit"]), 6),
-    }
-    if state.get(key) == current:
-        return
-    msg = (
-        f"[SIGNAL] {symbol} tf={SIGNAL_TIMEFRAME} signal={plan['signal']} reason={plan['reason']} "
-        f"entry={plan['entry']:.4f} sl={plan['stop_loss']:.4f} tp={plan['take_profit']:.4f} "
-        f"signal_ex={sig_ex} chart_tf={chart_timeframe} chart_ex={chart_ex} price={price:.4f}"
-    )
-    append_live_log(msg)
-    state[key] = current
-    save_signal_state(state)
+    save_json(SIGNAL_STATE_FILE, state)
 
 
 def get_history_count() -> int:
@@ -228,8 +177,7 @@ def get_history_count() -> int:
         return 0
     con = sqlite3.connect(db)
     try:
-        cur = con.execute("SELECT COUNT(1) FROM signal_history")
-        return int(cur.fetchone()[0])
+        return int(con.execute("SELECT COUNT(1) FROM signal_history").fetchone()[0])
     finally:
         con.close()
 
@@ -238,417 +186,388 @@ def run_proc(name: str, auto_trade: bool, symbol: str) -> None:
     cmd = [sys.executable, "crypto_deep_strategy.py", "--symbol", symbol, "--daemon", "--interval_minutes", "15", "--output_dir", "runtime"]
     if auto_trade:
         cmd.append("--auto_trade")
-    logger.info("Starting process name=%s auto_trade=%s symbol=%s", name, auto_trade, symbol)
     p = subprocess.Popen(cmd, cwd=ROOT)
-    data = load_pids()
-    data[name] = p.pid
-    save_pids(data)
+    pids = load_pids(); pids[name] = p.pid; save_pids(pids)
 
 
 def _resolve_exchanges() -> list[str]:
     preferred = os.getenv("PREFERRED_EXCHANGE", "").strip().lower()
-    exchanges = [preferred] + EXCHANGES if preferred else EXCHANGES
-    seen = set()
-    out = []
-    for ex in exchanges:
-        if ex and ex not in seen:
-            seen.add(ex)
-            out.append(ex)
+    items = [preferred] + EXCHANGES if preferred else EXCHANGES
+    out, seen = [], set()
+    for x in items:
+        if x and x not in seen:
+            seen.add(x); out.append(x)
     return out
 
 
-def fetch_market(symbol: str, timeframe: str, limit: int = 200, ttl_s: float = 0.0) -> Tuple[pd.DataFrame, str]:
-    cache_key = (symbol, timeframe, limit)
-    now = time.time()
-    cached = MARKET_CACHE.get(cache_key)
-    if cached and ttl_s > 0 and now - cached["ts"] <= ttl_s:
-        return cached["df"].copy(), cached["exchange"]
+def _timeframe_ms(tf: str) -> int:
+    return int(tf[:-1]) * {"m": 60_000, "h": 3_600_000, "d": 86_400_000, "w": 604_800_000}[tf[-1]]
 
+
+def fetch_market(symbol: str, timeframe: str, limit: int = 600, ttl_s: float = 0.0) -> Tuple[pd.DataFrame, str]:
+    key = (symbol, timeframe, limit)
+    now = time.time()
+    c = MARKET_CACHE.get(key)
+    if c and ttl_s > 0 and now - c["ts"] <= ttl_s:
+        return c["df"].copy(), c["exchange"]
     errors = []
     for ex_name in _resolve_exchanges():
         try:
-            ex_class = getattr(ccxt, ex_name)
-            ex = ex_class({"enableRateLimit": True})
+            ex = getattr(ccxt, ex_name)({"enableRateLimit": True})
             rows = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
             if not rows:
-                errors.append(f"{ex_name}: empty ohlcv")
                 continue
             df = pd.DataFrame(rows, columns=["ts", "Open", "High", "Low", "Close", "Volume"])
             df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert(CN_TZ).dt.tz_localize(None)
-            MARKET_CACHE[cache_key] = {"ts": now, "df": df.copy(), "exchange": ex_name}
-            logger.info("Fetched market data symbol=%s timeframe=%s exchange=%s rows=%s", symbol, timeframe, ex_name, len(df))
+            MARKET_CACHE[key] = {"ts": now, "df": df.copy(), "exchange": ex_name}
             return df, ex_name
         except Exception as e:
-            logger.warning("Fetch market failed exchange=%s symbol=%s timeframe=%s error=%s", ex_name, symbol, timeframe, e)
             errors.append(f"{ex_name}: {e}")
-
     raise RuntimeError(" ; ".join(errors))
 
 
-def _timeframe_ms(timeframe: str) -> int:
-    unit = timeframe[-1]
-    num = int(timeframe[:-1])
-    mult = {"m": 60 * 1000, "h": 3600 * 1000, "d": 86400 * 1000, "w": 7 * 86400 * 1000}
-    if unit not in mult:
-        raise ValueError(f"unsupported timeframe: {timeframe}")
-    return num * mult[unit]
-
-
-def fetch_full_ohlcv(symbol: str, timeframe: str = "4h", per_call_limit: int = 1000) -> tuple[pd.DataFrame, str]:
+def fetch_full_ohlcv(symbol: str, timeframe: str = "4h") -> tuple[pd.DataFrame, str]:
+    start_since = int(datetime(2017, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
     tf_ms = _timeframe_ms(timeframe)
     errors = []
     for ex_name in _resolve_exchanges():
         try:
             ex = getattr(ccxt, ex_name)({"enableRateLimit": True})
-            since = None
-            all_rows = []
-            rounds = 0
-            while rounds < 500:
-                rows = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=per_call_limit)
+            since, rows_all = start_since, []
+            for _ in range(2500):
+                rows = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=1000)
                 if not rows:
                     break
-                if all_rows and rows[0][0] <= all_rows[-1][0]:
-                    rows = [r for r in rows if r[0] > all_rows[-1][0]]
+                if rows_all and rows[0][0] <= rows_all[-1][0]:
+                    rows = [r for r in rows if r[0] > rows_all[-1][0]]
                 if not rows:
                     break
-                all_rows.extend(rows)
+                rows_all.extend(rows)
                 since = rows[-1][0] + tf_ms
-                rounds += 1
-                if len(rows) < per_call_limit:
+                if len(rows) < 1000:
                     break
                 time.sleep(ex.rateLimit / 1000.0)
-
-            if not all_rows:
-                raise RuntimeError("empty ohlcv")
-            df = pd.DataFrame(all_rows, columns=["ts", "Open", "High", "Low", "Close", "Volume"])
-            df = df.drop_duplicates(subset=["ts"]).sort_values("ts")
+            if not rows_all:
+                raise RuntimeError("empty")
+            df = pd.DataFrame(rows_all, columns=["ts", "Open", "High", "Low", "Close", "Volume"]).drop_duplicates("ts").sort_values("ts")
             df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert(CN_TZ).dt.tz_localize(None)
-            logger.info("Fetched full history symbol=%s tf=%s ex=%s rows=%s", symbol, timeframe, ex_name, len(df))
             return df, ex_name
-        except Exception as exc:
-            errors.append(f"{ex_name}: {exc}")
+        except Exception as e:
+            errors.append(f"{ex_name}: {e}")
     raise RuntimeError(" ; ".join(errors))
 
 
 def _apply_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out["ema20"] = out["Close"].ewm(span=20, adjust=False).mean()
-    out["ema50"] = out["Close"].ewm(span=50, adjust=False).mean()
-    out["ema89"] = out["Close"].ewm(span=89, adjust=False).mean()
-    out["ema144"] = out["Close"].ewm(span=144, adjust=False).mean()
-    out["ema169"] = out["Close"].ewm(span=169, adjust=False).mean()
+    d = df.copy()
+    d["ema89"] = d["Close"].ewm(span=89, adjust=False).mean()
+    d["ema144"] = d["Close"].ewm(span=144, adjust=False).mean()
+    d["ema169"] = d["Close"].ewm(span=169, adjust=False).mean()
+    d["ema20"] = d["Close"].ewm(span=20, adjust=False).mean()
+    d["ema50"] = d["Close"].ewm(span=50, adjust=False).mean()
 
-    delta = out["Close"].diff()
-    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean().replace(0, 1e-9)
-    rs = gain / loss
-    out["rsi14"] = 100 - 100 / (1 + rs)
+    ema12 = d["Close"].ewm(span=12, adjust=False).mean(); ema26 = d["Close"].ewm(span=26, adjust=False).mean()
+    d["macd"] = ema12 - ema26; d["macd_signal"] = d["macd"].ewm(span=9, adjust=False).mean(); d["macd_hist"] = d["macd"] - d["macd_signal"]
 
-    ema12 = out["Close"].ewm(span=12, adjust=False).mean()
-    ema26 = out["Close"].ewm(span=26, adjust=False).mean()
-    out["macd"] = ema12 - ema26
-    out["macd_signal"] = out["macd"].ewm(span=9, adjust=False).mean()
-    out["macd_hist"] = out["macd"] - out["macd_signal"]
+    tr = pd.concat([(d["High"] - d["Low"]), (d["High"] - d["Close"].shift(1)).abs(), (d["Low"] - d["Close"].shift(1)).abs()], axis=1).max(axis=1)
+    d["atr14"] = tr.rolling(14).mean().bfill()
 
-    tr = pd.concat([
-        (out["High"] - out["Low"]),
-        (out["High"] - out["Close"].shift(1)).abs(),
-        (out["Low"] - out["Close"].shift(1)).abs(),
-    ], axis=1).max(axis=1)
-    out["atr14"] = tr.rolling(14).mean().bfill()
-    out["highest_20"] = out["High"].rolling(20).max()
-    out["lowest_20"] = out["Low"].rolling(20).min()
-    return out
+    delta = d["Close"].diff(); gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean(); loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean().replace(0, 1e-9)
+    d["rsi14"] = 100 - 100 / (1 + gain / loss)
+
+    d["vol_sma20"] = d["Volume"].rolling(20).mean(); d["vol_ratio"] = d["Volume"] / d["vol_sma20"].replace(0, np.nan)
+    d["highest_20"] = d["High"].rolling(20).max(); d["lowest_20"] = d["Low"].rolling(20).min()
+    d["obv"] = (np.sign(d["Close"].diff().fillna(0)) * d["Volume"]).cumsum(); d["obv_ema20"] = d["obv"].ewm(span=20, adjust=False).mean()
+    return d
 
 
-def _signal_for_strategy(row: pd.Series, strategy: str) -> int:
-    if strategy == "ema_trend":
-        if row["ema20"] > row["ema50"] > row["ema89"]:
-            return 1
-        if row["ema20"] < row["ema50"] < row["ema89"]:
-            return -1
-        return 0
-    if strategy == "rsi_reversion":
-        if row["rsi14"] < 30:
-            return 1
-        if row["rsi14"] > 70:
-            return -1
-        return 0
-    if strategy == "macd_momentum":
-        return 1 if row["macd_hist"] > 0 else -1 if row["macd_hist"] < 0 else 0
-    if strategy == "breakout_20":
-        if row["Close"] > row["highest_20"]:
-            return 1
-        if row["Close"] < row["lowest_20"]:
-            return -1
-        return 0
-    if strategy == "ema89_144_cross":
-        return 1 if row["ema89"] > row["ema144"] else -1 if row["ema89"] < row["ema144"] else 0
+def _ema_cross_signal(row: pd.Series, prev: pd.Series) -> int:
+    bull = prev["ema89"] <= prev["ema144"] and row["ema89"] > row["ema144"]
+    bear = prev["ema89"] >= prev["ema144"] and row["ema89"] < row["ema144"]
+    if bull and row["Close"] > row["ema89"] > row["ema144"] and row["Close"] > row["ema169"]:
+        return 1
+    if bear and row["Close"] < row["ema89"] < row["ema144"] and row["Close"] < row["ema169"]:
+        return -1
     return 0
 
 
-def _evaluate_with_params(df: pd.DataFrame, strategy: str, horizon: int, stop_mult: float, risk_reward: float, fee: float) -> dict:
-    rets = []
-    wins = 0
-    for i in range(220, len(df) - horizon):
-        row = df.iloc[i]
-        sig = _signal_for_strategy(row, strategy)
-        if sig == 0:
+def _macd_divergence_points(df: pd.DataFrame, lookback: int = 60) -> Tuple[List[int], List[int]]:
+    bull, bear = [], []
+    for i in range(lookback + 5, len(df)):
+        w = df.iloc[i - lookback : i + 1]
+        highs = w["High"].rolling(5, center=True).max(); lows = w["Low"].rolling(5, center=True).min()
+        ph = w.index[w["High"] == highs]; pl = w.index[w["Low"] == lows]
+        if len(ph) >= 2:
+            i1, i2 = ph[-2], ph[-1]
+            if w.loc[i2, "High"] > w.loc[i1, "High"] and w.loc[i2, "macd"] < w.loc[i1, "macd"]:
+                bear.append(i)
+        if len(pl) >= 2:
+            i1, i2 = pl[-2], pl[-1]
+            if w.loc[i2, "Low"] < w.loc[i1, "Low"] and w.loc[i2, "macd"] > w.loc[i1, "macd"]:
+                bull.append(i)
+    return bull, bear
+
+
+def build_signal_plan(df_4h_raw: pd.DataFrame) -> SignalPlan:
+    d = _apply_indicators(df_4h_raw)
+    row, prev = d.iloc[-2], d.iloc[-3]  # 已收盘4h
+    cross = _ema_cross_signal(row, prev)
+    bull_div, bear_div = _macd_divergence_points(d, lookback=60)
+    idx = len(d) - 2
+    div = -1 if idx in set(bear_div) else 1 if idx in set(bull_div) else 0
+    entry = float(row["Close"])
+    dist = max(float(row["atr14"]) * 1.2, entry * 0.004)
+    if cross == 1:
+        return SignalPlan("做多", "EMA89上穿EMA144且站上EMA169(4h收盘确认)", str(row["ts"]), entry, entry - dist, entry + dist * 1.8)
+    if cross == -1:
+        return SignalPlan("做空", "EMA89下穿EMA144且跌破EMA169(4h收盘确认)", str(row["ts"]), entry, entry + dist, entry - dist * 1.8)
+    if div == -1:
+        return SignalPlan("止盈", "4h MACD顶背离", str(row["ts"]), entry, entry, entry)
+    if div == 1:
+        return SignalPlan("止盈", "4h MACD底背离", str(row["ts"]), entry, entry, entry)
+    return SignalPlan("空仓", "无新信号", str(row["ts"]), entry, entry, entry)
+
+
+def maybe_log_signal(symbol: str, plan: SignalPlan, chart_timeframe: str, chart_ex: str, sig_ex: str, price: float) -> None:
+    state = load_signal_state(); key = f"{symbol}:{SIGNAL_TIMEFRAME}"; last = state.get(key, {})
+    if last.get("signal_ts") == plan.signal_ts and last.get("signal") == plan.signal:
+        return
+    append_live_log(
+        f"[SIGNAL] {symbol} tf={SIGNAL_TIMEFRAME} signal={plan.signal} reason={plan.reason} "
+        f"entry={plan.entry:.4f} sl={plan.stop_loss:.4f} tp={plan.take_profit:.4f} signal_ex={sig_ex} chart_tf={chart_timeframe} chart_ex={chart_ex} price={price:.4f}"
+    )
+    state[key] = {"signal": plan.signal, "signal_ts": plan.signal_ts, "entry": round(plan.entry, 6), "stop_loss": round(plan.stop_loss, 6), "take_profit": round(plan.take_profit, 6)}
+    save_signal_state(state)
+
+
+def _simulate_trades(df: pd.DataFrame, signal_fn, stop_mult: float, hold_max: int, bull_set: set[int], bear_set: set[int], fee: float = 0.0008) -> List[float]:
+    """Position lifecycle backtest:
+    - entry by strategy signal
+    - exits by ATR stop / MACD divergence / reverse signal / timeout
+    - reverse signal closes and immediately reopens opposite position on next bar open
+    """
+    rets: List[float] = []
+    pos = 0
+    entry = sl = 0.0
+    entry_i = 0
+
+    for i in range(200, len(df) - 1):
+        row, prev, nxt = df.iloc[i], df.iloc[i - 1], df.iloc[i + 1]
+        sig = signal_fn(df, i, row, prev)
+
+        if pos == 0:
+            if sig == 0:
+                continue
+            pos = sig
+            entry = float(nxt["Open"])
+            d = max(float(row["atr14"]) * stop_mult, entry * 0.004)
+            sl = entry - d if pos == 1 else entry + d
+            entry_i = i + 1
             continue
-        entry = float(row["Close"])
-        stop_dist = max(float(row["atr14"]) * stop_mult, entry * 0.004)
-        sl = entry - stop_dist if sig == 1 else entry + stop_dist
-        tp = entry + stop_dist * risk_reward if sig == 1 else entry - stop_dist * risk_reward
 
-        fwd = df.iloc[i + 1 : i + 1 + horizon]
-        exit_px = float(fwd.iloc[-1]["Close"])
-        for _, rr in fwd.iterrows():
-            px = float(rr["Close"])
-            if (sig == 1 and px <= sl) or (sig == -1 and px >= sl):
-                exit_px = sl
-                break
-            if (sig == 1 and px >= tp) or (sig == -1 and px <= tp):
-                exit_px = tp
-                break
-        ret = ((exit_px - entry) / entry) * sig - fee
-        rets.append(ret)
-        if ret > 0:
-            wins += 1
+        exit_px = float(nxt["Close"])
+        exit_flag = None
+        reverse_to = 0
 
-    if not rets:
-        return {
-            "trades": 0,
-            "win_rate": 0.0,
-            "return_rate": 0.0,
-            "profit_factor": 0.0,
-            "max_drawdown": 0.0,
-            "params": {"horizon": horizon, "stop_mult": stop_mult, "risk_reward": risk_reward},
-        }
+        # hard stop
+        if pos == 1 and float(nxt["Low"]) <= sl:
+            exit_flag, exit_px = "sl", sl
+        elif pos == -1 and float(nxt["High"]) >= sl:
+            exit_flag, exit_px = "sl", sl
 
-    ser = pd.Series(rets)
-    eq = (1 + ser).cumprod()
-    dd = (eq - eq.cummax()) / eq.cummax()
-    gain = float(ser[ser > 0].sum())
-    loss = float(abs(ser[ser <= 0].sum()))
+        if exit_flag is None:
+            div_sig = -1 if i in bear_set else 1 if i in bull_set else 0
+            if div_sig == (-1 if pos == 1 else 1):
+                exit_flag = "macd_div_tp"
+            elif sig == -pos:
+                exit_flag = "reverse"
+                reverse_to = sig
+            elif i - entry_i >= hold_max:
+                exit_flag = "timeout"
+
+        if exit_flag:
+            rets.append(((exit_px - entry) / entry) * pos - fee)
+            pos = 0
+
+            if reverse_to != 0:
+                pos = reverse_to
+                entry = float(nxt["Open"])
+                d = max(float(row["atr14"]) * stop_mult, entry * 0.004)
+                sl = entry - d if pos == 1 else entry + d
+                entry_i = i + 1
+
+    return rets
+
+
+def _metrics(returns: List[float], exposure: float = 1.0) -> dict:
+    if not returns:
+        return {"trades": 0, "win_rate": 0.0, "return_rate": 0.0, "profit_factor": 0.0, "max_drawdown": 0.0}
+    sr = pd.Series(np.array(returns) * exposure)
+    eq = (1 + sr).cumprod(); dd = (eq - eq.cummax()) / eq.cummax()
+    gain = float(sr[sr > 0].sum()); loss = float(abs(sr[sr <= 0].sum()))
     return {
-        "trades": int(len(ser)),
-        "win_rate": float(wins / len(ser)),
+        "trades": int(len(sr)),
+        "win_rate": float((sr > 0).mean()),
         "return_rate": float(eq.iloc[-1] - 1),
         "profit_factor": float(gain / loss) if loss > 0 else float("inf"),
         "max_drawdown": float(dd.min()),
-        "params": {"horizon": horizon, "stop_mult": stop_mult, "risk_reward": risk_reward},
     }
 
 
-def _best_strategy_report(df: pd.DataFrame, profile: str) -> dict:
-    strategies = ["ema_trend", "rsi_reversion", "macd_momentum", "breakout_20", "ema89_144_cross"]
-    if profile == "deep":
-        horizons = [4, 6, 8, 10, 12]
-        stop_mults = [0.9, 1.1, 1.3, 1.5]
-        rrs = [1.2, 1.5, 1.8, 2.0, 2.3]
-    else:
-        horizons = [6, 10]
-        stop_mults = [1.0, 1.3]
-        rrs = [1.5, 1.8]
+def _exposure_for_dd(returns: List[float], dd_limit: float = 0.20) -> float:
+    if not returns:
+        return 0.0
+    lo, hi = 0.01, 5.0
+    for _ in range(28):
+        mid = (lo + hi) / 2
+        m = _metrics(returns, mid)
+        if abs(m["max_drawdown"]) <= dd_limit:
+            lo = mid
+        else:
+            hi = mid
+    return round(lo, 4)
 
+
+def _recommend_leverage_and_margin(exposure: float) -> tuple[float, float]:
+    if exposure <= 0:
+        return 1.0, 0.0
+    # exposure ~= leverage * margin_pct
+    # pick small leverage preference
+    best = None
+    for lev in [1, 2, 3, 4, 5, 6, 8, 10]:
+        margin = min(exposure / lev, 1.0)
+        eff = lev * margin
+        gap = abs(eff - exposure) + lev * 0.01
+        cand = (gap, float(lev), round(float(margin), 4))
+        if best is None or cand < best:
+            best = cand
+    return best[1], best[2]
+
+
+def _strategy_signal_factory(name: str):
+    def sig_ema(df, i, row, prev):
+        return _ema_cross_signal(row, prev)
+
+    def sig_confluence(df, i, row, prev):
+        ema_trend = 1 if row["ema20"] > row["ema50"] > row["ema89"] else -1 if row["ema20"] < row["ema50"] < row["ema89"] else 0
+        macd = 1 if row["macd_hist"] > 0 else -1 if row["macd_hist"] < 0 else 0
+        rsi = 1 if row["rsi14"] > 55 else -1 if row["rsi14"] < 45 else 0
+        vol = 1 if row["vol_ratio"] > 1.2 and row["obv"] > row["obv_ema20"] else -1 if row["vol_ratio"] > 1.2 and row["obv"] < row["obv_ema20"] else 0
+        score = ema_trend + macd + rsi + vol
+        return 1 if score >= 3 else -1 if score <= -3 else 0
+
+    def sig_breakout(df, i, row, prev):
+        if row["Close"] > row["highest_20"] and row["vol_ratio"] > 1.3:
+            return 1
+        if row["Close"] < row["lowest_20"] and row["vol_ratio"] > 1.3:
+            return -1
+        return 0
+
+    return {"ema_cross_89_144_169": sig_ema, "multi_confluence": sig_confluence, "volume_breakout": sig_breakout}[name]
+
+
+def _profile_grid(profile: str):
+    if profile == "deep":
+        return [(s, h) for s in [0.9, 1.1, 1.3, 1.5, 1.8] for h in [24, 36, 48, 72, 96]]
+    return [(s, h) for s in [1.0, 1.2, 1.4] for h in [24, 48, 72]]
+
+
+def _backtest_engine(df: pd.DataFrame, profile: str) -> dict:
+    strategies = ["ema_cross_89_144_169", "multi_confluence", "volume_breakout"]
+    grid = _profile_grid(profile)
     out = {}
-    for strategy in strategies:
+    bull_div, bear_div = _macd_divergence_points(df, lookback=60)
+    bull_set, bear_set = set(bull_div), set(bear_div)
+
+    for st in strategies:
+        sig_fn = _strategy_signal_factory(st)
         best = None
-        tested = 0
-        for h in horizons:
-            for sm in stop_mults:
-                for rr in rrs:
-                    tested += 1
-                    result = _evaluate_with_params(df, strategy, h, sm, rr, fee=0.0008)
-                    if best is None:
-                        best = result
-                    else:
-                        left = (result["return_rate"], result["win_rate"], result["profit_factor"])
-                        right = (best["return_rate"], best["win_rate"], best["profit_factor"])
-                        if left > right:
-                            best = result
-        best["tested_param_sets"] = tested
-        out[strategy] = best
-    return out
+        for (s, h) in grid:
+            base_returns = _simulate_trades(df, sig_fn, s, h, bull_set, bear_set)
+            exposure = _exposure_for_dd(base_returns, dd_limit=0.20)
+            lev, margin = _recommend_leverage_and_margin(exposure)
+            m = _metrics(base_returns, exposure)
+            m["recommended_exposure"] = exposure
+            m["recommended_leverage"] = lev
+            m["recommended_margin_pct"] = margin
+            m["params"] = {"stop_mult": s, "hold_bars_max": h}
+            m["tested_param_sets"] = len(grid)
+            if best is None or (m["return_rate"], m["profit_factor"], m["win_rate"]) > (best["return_rate"], best["profit_factor"], best["win_rate"]):
+                best = m
+        out[st] = best
+
+    ranked = sorted(out.items(), key=lambda kv: (kv[1]["return_rate"], kv[1]["profit_factor"]), reverse=True)
+    return {
+        "strategies": {k: v for k, v in out.items()},
+        "ranked": [{"strategy": k, **v} for k, v in ranked],
+        "best": {"strategy": ranked[0][0], **ranked[0][1]},
+    }
 
 
 def _render_report_md(report: dict) -> str:
-    lines = ["# 全历史4h回测报告", ""]
-    lines.append(f"- 生成时间(中国时区): {report['generated_at_cn']}")
-    lines.append(f"- 分析强度: {report['profile']}")
-    lines.append("")
-    for sym, data in report["symbols"].items():
-        lines.append(f"## {sym}")
-        lines.append(f"- 数据源: {data['exchange']}")
-        lines.append(f"- K线数量: {data['rows']}")
-        lines.append(f"- 时间范围: {data['from']} -> {data['to']}")
-        lines.append("")
-        lines.append("| 策略 | 参数组合数 | 交易次数 | 胜率 | 收益率 | 盈亏比(PF) | 最大回撤 |")
-        lines.append("|---|---:|---:|---:|---:|---:|---:|")
-        for item in data["ranked"]:
-            lines.append(
-                f"| {item['strategy']} | {item['tested_param_sets']} | {item['trades']} | {item['win_rate']:.2%} | {item['return_rate']:.2%} | {item['profit_factor']:.3f} | {item['max_drawdown']:.2%} |"
-            )
+    lines = ["# 全历史4h回测报告", "", f"- 生成时间(中国时区): {report['generated_at_cn']}", f"- 分析强度: {report['profile']}", "- 回撤约束: 目标最大回撤 <= 20%，通过历史收益序列反推推荐杠杆和仓位", ""]
+    for sym, d in report["symbols"].items():
+        lines += [f"## {sym}", f"- 数据源: {d['exchange']}", f"- K线数量: {d['rows']}", f"- 时间范围: {d['from']} -> {d['to']}", "", "| 策略 | 参数组合数 | 推荐杠杆 | 推荐仓位 | 交易次数 | 胜率 | 收益率 | 盈亏比(PF) | 最大回撤 |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+        for item in d["engine"]["ranked"]:
+            lines.append(f"| {item['strategy']} | {item['tested_param_sets']} | {item['recommended_leverage']:.1f}x | {item['recommended_margin_pct']:.2%} | {item['trades']} | {item['win_rate']:.2%} | {item['return_rate']:.2%} | {item['profit_factor']:.3f} | {item['max_drawdown']:.2%} |")
         lines.append("")
     return "\n".join(lines)
 
 
 def _analyze_symbol(symbol: str, profile: str) -> dict:
-    df, ex_name = fetch_full_ohlcv(symbol, timeframe="4h", per_call_limit=1000)
-    dfi = _apply_indicators(df)
-    results = _best_strategy_report(dfi, profile)
-    ranked = sorted(results.items(), key=lambda kv: (kv[1]["return_rate"], kv[1]["win_rate"]), reverse=True)
-    return {
-        "exchange": ex_name,
-        "rows": int(len(df)),
-        "from": str(df.iloc[0]["ts"]),
-        "to": str(df.iloc[-1]["ts"]),
-        "ranked": [{"strategy": k, **v} for k, v in ranked],
-        "best": {"strategy": ranked[0][0], **ranked[0][1]} if ranked else None,
-    }
+    df, ex_name = fetch_full_ohlcv(symbol, timeframe="4h")
+    di = _apply_indicators(df)
+    engine = _backtest_engine(di, profile)
+    return {"exchange": ex_name, "rows": int(len(di)), "from": str(di.iloc[0]["ts"]), "to": str(di.iloc[-1]["ts"]), "engine": engine}
 
 
 def _run_backtest_job(symbol_choice: str, profile: str) -> None:
-    save_backtest_status({"running": True, "status": "running", "stage": f"启动任务 symbol={symbol_choice} profile={profile}"})
-    append_live_log(f"开始执行全历史4h回测 symbol={symbol_choice} profile={profile}")
+    save_json(BACKTEST_STATUS_FILE, {"running": True, "status": "running", "stage": f"start {symbol_choice}/{profile}", "updated_at": datetime.now(CN_TZ).isoformat()})
     try:
-        symbols = ["BTC/USDT", "ETH/USDT"] if symbol_choice == "BOTH" else [symbol_choice]
-        report = {
-            "generated_at_cn": datetime.now(CN_TZ).isoformat(),
-            "profile": profile,
-            "timeframe": "4h",
-            "symbols": {},
-            "summary": {},
-        }
-        for sym in symbols:
-            save_backtest_status({"running": True, "status": "running", "stage": f"分析 {sym}（全历史+参数网格）"})
-            report["symbols"][sym] = _analyze_symbol(sym, profile)
-
-        for sym, data in report["symbols"].items():
-            best = data.get("best") or {}
-            report["summary"][sym] = {
-                "best_strategy": best.get("strategy"),
-                "trades": best.get("trades"),
-                "win_rate": best.get("win_rate"),
-                "return_rate": best.get("return_rate"),
-                "profit_factor": best.get("profit_factor"),
-                "max_drawdown": best.get("max_drawdown"),
-            }
-
-        BACKTEST_REPORT_FILE.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        syms = ["BTC/USDT", "ETH/USDT"] if symbol_choice == "BOTH" else [symbol_choice]
+        report = {"generated_at_cn": datetime.now(CN_TZ).isoformat(), "profile": profile, "signal_timeframe": "4h", "symbols": {}}
+        for s in syms:
+            save_json(BACKTEST_STATUS_FILE, {"running": True, "status": "running", "stage": f"analyzing {s}", "updated_at": datetime.now(CN_TZ).isoformat()})
+            report["symbols"][s] = _analyze_symbol(s, profile)
+        save_json(BACKTEST_REPORT_FILE, report)
         BACKTEST_REPORT_MD_FILE.write_text(_render_report_md(report), encoding="utf-8")
-        save_backtest_status(
-            {
-                "running": False,
-                "status": "done",
-                "stage": "完成",
-                "report_file": str(BACKTEST_REPORT_FILE),
-                "report_md_file": str(BACKTEST_REPORT_MD_FILE),
-            }
-        )
-        append_live_log("全历史4h回测任务完成，报告已生成")
-    except Exception as exc:
-        save_backtest_status({"running": False, "status": "failed", "stage": "异常", "error": str(exc)})
-        append_live_log(f"回测任务失败: {exc}")
-
-
-def build_signal_plan(df_4h: pd.DataFrame) -> dict:
-    dfi = _apply_indicators(df_4h)
-    entry = float(dfi.iloc[-1]["Close"])
-    atr = float(dfi.iloc[-1]["atr14"]) if len(dfi) else max(entry * 0.01, 1e-8)
-    stop_dist = max(atr * 1.2, entry * 0.006)
-
-    if dfi.iloc[-1]["ema20"] > dfi.iloc[-1]["ema50"]:
-        signal, reason = "做多", "EMA20>EMA50(4h)"
-        sl = entry - stop_dist
-        tp = entry + stop_dist * 1.8
-    elif dfi.iloc[-1]["ema20"] < dfi.iloc[-1]["ema50"]:
-        signal, reason = "做空", "EMA20<EMA50(4h)"
-        sl = entry + stop_dist
-        tp = entry - stop_dist * 1.8
-    else:
-        signal, reason = "空仓", "EMA20≈EMA50(4h)"
-        sl = entry
-        tp = entry
-
-    return {
-        "signal": signal,
-        "reason": reason,
-        "entry": entry,
-        "stop_loss": float(sl),
-        "take_profit": float(tp),
-        "signal_ts": dfi.iloc[-1]["ts"],
-    }
+        save_json(BACKTEST_STATUS_FILE, {"running": False, "status": "done", "stage": "完成", "report_file": str(BACKTEST_REPORT_FILE), "report_md_file": str(BACKTEST_REPORT_MD_FILE), "updated_at": datetime.now(CN_TZ).isoformat()})
+        append_live_log("全历史回测完成")
+    except Exception as e:
+        save_json(BACKTEST_STATUS_FILE, {"running": False, "status": "failed", "stage": "异常", "error": str(e), "updated_at": datetime.now(CN_TZ).isoformat()})
+        append_live_log(f"回测失败: {e}")
 
 
 @app.get("/")
 def index():
-    symbol = request.args.get("symbol", "BTC/USDT")
-    timeframe = request.args.get("timeframe", "15m")
-    if symbol not in SYMBOLS:
-        symbol = SYMBOLS[0]
-    if timeframe not in TIMEFRAMES:
-        timeframe = TIMEFRAMES[1]
-
+    symbol = request.args.get("symbol", SYMBOLS[0]); timeframe = request.args.get("timeframe", "15m")
+    if symbol not in SYMBOLS: symbol = SYMBOLS[0]
+    if timeframe not in TIMEFRAMES: timeframe = "15m"
     latest = RUNTIME / "latest_signal.json"
-    payload = latest.read_text(encoding="utf-8") if latest.exists() else "暂无数据（请先点击“运行一次策略”或开启daemon）"
-    msg = request.args.get("msg", "")
-    return render_template_string(
-        HTML,
-        payload=payload,
-        history_count=get_history_count(),
-        msg=msg,
-        symbol=symbol,
-        timeframe=timeframe,
-        symbols=SYMBOLS,
-        timeframes=TIMEFRAMES,
-        live_log=tail_live_log(),
-    )
+    payload = latest.read_text(encoding="utf-8") if latest.exists() else "暂无数据"
+    return render_template_string(HTML, payload=payload, history_count=get_history_count(), msg=request.args.get("msg", ""), symbol=symbol, timeframe=timeframe, symbols=SYMBOLS, timeframes=TIMEFRAMES, live_log=tail_live_log())
 
 
 @app.get("/api/market_status")
 def api_market_status():
-    symbol = request.args.get("symbol", "BTC/USDT")
-    chart_timeframe = request.args.get("timeframe", "15m")
+    symbol = request.args.get("symbol", SYMBOLS[0]); tf = request.args.get("timeframe", "15m")
     try:
-        chart_df, chart_ex = fetch_market(symbol, chart_timeframe, 220, ttl_s=4.0)
-        sig_df, sig_ex = fetch_market(symbol, SIGNAL_TIMEFRAME, 420, ttl_s=10.0)
+        chart_df, chart_ex = fetch_market(symbol, tf, 600, ttl_s=4.0)
+        sig_df, sig_ex = fetch_market(symbol, SIGNAL_TIMEFRAME, 1800, ttl_s=20.0)
         plan = build_signal_plan(sig_df)
-        price = float(chart_df.iloc[-1]["Close"])
-        maybe_log_signal(symbol, plan, chart_timeframe, chart_ex, sig_ex, price)
-        return jsonify(
-            {
-                "ok": True,
-                "symbol": symbol,
-                "chart_timeframe": chart_timeframe,
-                "signal_timeframe": SIGNAL_TIMEFRAME,
-                "time": str(chart_df.iloc[-1]["ts"]),
-                "price": round(price, 2),
-                "signal": plan["signal"],
-                "reason": plan["reason"],
-                "entry": round(plan["entry"], 2),
-                "stop_loss": round(plan["stop_loss"], 2),
-                "take_profit": round(plan["take_profit"], 2),
-                "exchange_chart": chart_ex,
-                "exchange_signal": sig_ex,
-            }
-        )
+        px = float(chart_df.iloc[-1]["Close"])
+        maybe_log_signal(symbol, plan, tf, chart_ex, sig_ex, px)
+        return jsonify({"ok": True, "symbol": symbol, "chart_timeframe": tf, "signal_timeframe": SIGNAL_TIMEFRAME, "signal_ts": plan.signal_ts, "price": round(px, 2), "signal": plan.signal, "reason": plan.reason, "entry": round(plan.entry, 2), "stop_loss": round(plan.stop_loss, 2), "take_profit": round(plan.take_profit, 2), "exchange_chart": chart_ex, "exchange_signal": sig_ex})
     except Exception as e:
-        append_live_log(f"ERROR {symbol} 所有交易所不可用: {e}")
+        append_live_log(f"ERROR market_status: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.get("/api/backtest_status")
 def api_backtest_status():
-    status = load_backtest_status()
-    if BACKTEST_REPORT_FILE.exists():
-        try:
-            status["report"] = json.loads(BACKTEST_REPORT_FILE.read_text(encoding="utf-8"))
-        except Exception as exc:
-            status["report_error"] = str(exc)
-    if BACKTEST_REPORT_MD_FILE.exists():
-        status["report_markdown"] = BACKTEST_REPORT_MD_FILE.read_text(encoding="utf-8")
-    return jsonify(status)
+    s = load_json(BACKTEST_STATUS_FILE, {"running": False, "status": "idle", "updated_at": None})
+    if BACKTEST_REPORT_FILE.exists(): s["report"] = load_json(BACKTEST_REPORT_FILE, {})
+    if BACKTEST_REPORT_MD_FILE.exists(): s["report_markdown"] = BACKTEST_REPORT_MD_FILE.read_text(encoding="utf-8")
+    return jsonify(s)
 
 
 @app.get("/api/live_log_tail")
@@ -658,176 +577,88 @@ def api_live_log_tail():
 
 @app.post("/run_backtest")
 def run_backtest():
-    symbol = request.args.get("symbol", "BTC/USDT")
-    timeframe = request.args.get("timeframe", "15m")
-    selected = request.form.get("backtest_symbol", "BOTH")
-    profile = request.form.get("profile", "deep")
-    if selected not in {"BTC/USDT", "ETH/USDT", "BOTH"}:
-        selected = "BOTH"
-    if profile not in {"standard", "deep"}:
-        profile = "deep"
+    symbol = request.args.get("symbol", SYMBOLS[0]); timeframe = request.args.get("timeframe", "15m")
+    selected = request.form.get("backtest_symbol", "BOTH"); profile = request.form.get("profile", "deep")
+    if selected not in {"BTC/USDT", "ETH/USDT", "BOTH"}: selected = "BOTH"
+    if profile not in {"standard", "deep"}: profile = "deep"
 
     global BACKTEST_THREAD
     with BACKTEST_LOCK:
         if BACKTEST_THREAD is not None and BACKTEST_THREAD.is_alive():
-            return redirect(url_for("index", msg="回测任务已在运行，请稍后查看状态", symbol=symbol, timeframe=timeframe))
+            return redirect(url_for("index", msg="回测任务已在运行", symbol=symbol, timeframe=timeframe))
         BACKTEST_THREAD = threading.Thread(target=_run_backtest_job, args=(selected, profile), daemon=True)
         BACKTEST_THREAD.start()
-    return redirect(
-        url_for(
-            "index",
-            msg=f"已启动全历史4h回测：symbol={selected}, profile={profile}，网格参数较大时会明显更慢",
-            symbol=symbol,
-            timeframe=timeframe,
-        )
-    )
-
-
-@app.post("/start_once")
-def start_once():
-    symbol = request.args.get("symbol", "BTC/USDT")
-    timeframe = request.args.get("timeframe", "15m")
-    subprocess.Popen([sys.executable, "crypto_deep_strategy.py", "--symbol", symbol, "--output_dir", "runtime"], cwd=ROOT)
-    append_live_log(f"触发单次策略运行 symbol={symbol} signal_tf={SIGNAL_TIMEFRAME}")
-    return redirect(url_for("index", msg="已触发单次运行（策略固定4h），请稍后刷新查看结果", symbol=symbol, timeframe=timeframe))
-
-
-@app.post("/start_daemon")
-def start_daemon():
-    symbol = request.args.get("symbol", "BTC/USDT")
-    timeframe = request.args.get("timeframe", "15m")
-    run_proc("daemon", auto_trade=False, symbol=symbol)
-    append_live_log(f"启动持续测试 daemon symbol={symbol} signal_tf={SIGNAL_TIMEFRAME}")
-    return redirect(url_for("index", msg="持续测试已启动（策略固定4h）", symbol=symbol, timeframe=timeframe))
+    return redirect(url_for("index", msg=f"已启动回测 symbol={selected}, profile={profile}（固定4h内核）", symbol=symbol, timeframe=timeframe))
 
 
 @app.post("/start_auto")
 def start_auto():
-    symbol = request.args.get("symbol", "BTC/USDT")
-    timeframe = request.args.get("timeframe", "15m")
+    symbol = request.args.get("symbol", SYMBOLS[0]); timeframe = request.args.get("timeframe", "15m")
     run_proc("auto", auto_trade=True, symbol=symbol)
     append_live_log(f"启动自动下单 daemon symbol={symbol} signal_tf={SIGNAL_TIMEFRAME}")
-    return redirect(url_for("index", msg="自动下单 daemon 已启动（策略固定4h，请先配置API Key）", symbol=symbol, timeframe=timeframe))
+    return redirect(url_for("index", msg="自动下单已启动（固定4h信号）", symbol=symbol, timeframe=timeframe))
 
 
 @app.post("/stop_all")
 def stop_all():
-    symbol = request.args.get("symbol", "BTC/USDT")
-    timeframe = request.args.get("timeframe", "15m")
-    data = load_pids()
-    for _, pid in data.items():
+    symbol = request.args.get("symbol", SYMBOLS[0]); timeframe = request.args.get("timeframe", "15m")
+    for _, pid in load_pids().items():
         try:
-            if os.name == "nt":
-                subprocess.run(["taskkill", "/PID", str(pid), "/F"], check=False)
-            else:
-                subprocess.run(["kill", "-9", str(pid)], check=False)
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"], check=False) if os.name == "nt" else subprocess.run(["kill", "-9", str(pid)], check=False)
         except Exception:
             pass
-    save_pids({})
-    append_live_log("停止所有后台任务")
+    save_pids({}); append_live_log("停止所有后台任务")
     return redirect(url_for("index", msg="后台任务已停止", symbol=symbol, timeframe=timeframe))
 
 
 @app.get("/chart")
 def chart():
-    symbol = request.args.get("symbol", "BTC/USDT")
-    timeframe = request.args.get("timeframe", "15m")
-    chart_file = RUNTIME / "chart_live.html"
+    symbol = request.args.get("symbol", SYMBOLS[0]); tf = request.args.get("timeframe", "15m")
+    out = RUNTIME / "chart_live.html"
     try:
-        limit_map = {"1m": 320, "15m": 360, "1h": 360, "4h": 360, "1d": 220, "1w": 140}
-        limit = limit_map.get(timeframe, 320)
-        df, ex_name = fetch_market(symbol, timeframe, limit, ttl_s=4.0)
-        dfi = _apply_indicators(df)
-        sig_df, _ = fetch_market(symbol, SIGNAL_TIMEFRAME, 420, ttl_s=10.0)
+        df, ex = fetch_market(symbol, tf, 700, ttl_s=4.0)
+        di = _apply_indicators(df)
+        sig_df, _ = fetch_market(symbol, SIGNAL_TIMEFRAME, 1800, ttl_s=20.0)
         plan = build_signal_plan(sig_df)
-        current_price = float(dfi.iloc[-1]["Close"])
+        bull_div, bear_div = _macd_divergence_points(di, lookback=60)
 
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.78, 0.22], vertical_spacing=0.03)
-        fig.add_trace(
-            go.Candlestick(
-                x=dfi["ts"],
-                open=dfi["Open"], high=dfi["High"], low=dfi["Low"], close=dfi["Close"],
-                name=f"{symbol} {timeframe}",
-            ),
-            row=1,
-            col=1,
-        )
+        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.62, 0.20, 0.18], vertical_spacing=0.03)
+        fig.add_trace(go.Candlestick(x=di["ts"], open=di["Open"], high=di["High"], low=di["Low"], close=di["Close"], name=f"{symbol} {tf}"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=di["ts"], y=di["ema89"], name="EMA89", line=dict(color="white", width=1.5)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=di["ts"], y=di["ema144"], name="EMA144", line=dict(color="yellow", width=1.5)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=di["ts"], y=di["ema169"], name="EMA169", line=dict(color="blue", width=1.5)), row=1, col=1)
+        fig.add_trace(go.Bar(x=di["ts"], y=di["Volume"], name="VOL", marker_color="#888"), row=2, col=1)
+        fig.add_trace(go.Scatter(x=di["ts"], y=di["macd"], name="MACD", line=dict(color="#00bcd4", width=1.2)), row=3, col=1)
+        fig.add_trace(go.Scatter(x=di["ts"], y=di["macd_signal"], name="MACD_SIGNAL", line=dict(color="#ff9800", width=1.0)), row=3, col=1)
+        fig.add_trace(go.Bar(x=di["ts"], y=di["macd_hist"], name="MACD_HIST", marker_color="#9c27b0", opacity=0.4), row=3, col=1)
 
-        fig.add_trace(go.Scatter(x=dfi["ts"], y=dfi["ema89"], mode="lines", name="EMA89", line=dict(color="white", width=1.5)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=dfi["ts"], y=dfi["ema144"], mode="lines", name="EMA144", line=dict(color="yellow", width=1.5)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=dfi["ts"], y=dfi["ema169"], mode="lines", name="EMA169", line=dict(color="blue", width=1.5)), row=1, col=1)
+        if bull_div:
+            fig.add_trace(go.Scatter(x=di.iloc[bull_div]["ts"], y=di.iloc[bull_div]["macd"], mode="markers", marker=dict(color="#00e676", size=8, symbol="triangle-up"), name="MACD底背离"), row=3, col=1)
+        if bear_div:
+            fig.add_trace(go.Scatter(x=di.iloc[bear_div]["ts"], y=di.iloc[bear_div]["macd"], mode="markers", marker=dict(color="#ff5252", size=8, symbol="triangle-down"), name="MACD顶背离"), row=3, col=1)
 
-        fig.add_trace(go.Bar(x=dfi["ts"], y=dfi["Volume"], name="Volume", marker_color="#888"), row=2, col=1)
+        cp = float(di.iloc[-1]["Close"])
+        fig.add_hline(y=cp, line_dash="dot", line_color="#f7b500", annotation_text=f"当前价:{cp:.2f}", row=1, col=1)
+        if plan.signal in {"做多", "做空", "止盈"}:
+            fig.add_hline(y=plan.stop_loss, line_dash="dash", line_color="#ff4d4f", annotation_text="止损", row=1, col=1)
+            fig.add_hline(y=plan.take_profit, line_dash="dash", line_color="#00c853", annotation_text="止盈", row=1, col=1)
 
-        sig_ts = pd.to_datetime(plan["signal_ts"])
-        nearest_idx = dfi[dfi["ts"] <= sig_ts].index
-        if len(nearest_idx) > 0 and plan["signal"] in {"做多", "做空"}:
-            i = nearest_idx[-1]
-            marker_y = float(dfi.iloc[i]["Close"])
-            marker_color = "#00ff7f" if plan["signal"] == "做多" else "#ff4d4f"
-            marker_symbol = "triangle-up" if plan["signal"] == "做多" else "triangle-down"
-            fig.add_trace(
-                go.Scatter(
-                    x=[dfi.iloc[i]["ts"]],
-                    y=[marker_y],
-                    mode="markers+text",
-                    marker=dict(size=14, color=marker_color, symbol=marker_symbol),
-                    text=[f"{plan['signal']}\\nSL:{plan['stop_loss']:.2f}\\nTP:{plan['take_profit']:.2f}"],
-                    textposition="top center",
-                    name="策略信号(4h)",
-                ),
-                row=1,
-                col=1,
-            )
-            fig.add_hline(y=plan["stop_loss"], line_dash="dash", line_color="#ff4d4f", annotation_text="止损", row=1, col=1)
-            fig.add_hline(y=plan["take_profit"], line_dash="dash", line_color="#00c853", annotation_text="止盈", row=1, col=1)
-
-        fig.add_hline(y=current_price, line_color="#f7b500", line_dash="dot", annotation_text=f"当前价: {current_price:.2f}", row=1, col=1)
-
-        fig.update_layout(
-            title=f"[{ex_name}] {symbol} {timeframe} 图表（中国时区，信号固定{SIGNAL_TIMEFRAME}）",
-            template="plotly_dark",
-            margin=dict(l=20, r=20, t=60, b=20),
-            dragmode="pan",
-            modebar_add=["drawline", "drawopenpath", "drawrect", "drawcircle", "eraseshape"],
-            modebar_remove=["lasso2d", "select2d"],
-        )
-        fig.update_xaxes(
-            rangeslider_visible=True,
-            rangeselector=dict(
-                buttons=[
-                    dict(count=1, label="1D", step="day", stepmode="backward"),
-                    dict(count=7, label="1W", step="day", stepmode="backward"),
-                    dict(count=1, label="1M", step="month", stepmode="backward"),
-                    dict(step="all", label="ALL"),
-                ]
-            ),
-            showspikes=True,
-            spikemode="across",
-            spikesnap="cursor",
-            spikedash="solid",
-        )
-        fig.update_yaxes(showspikes=True, spikemode="across", row=1, col=1)
+        fig.update_layout(title=f"[{ex}] {symbol} {tf} 展示 | 运行策略固定4h", template="plotly_dark", dragmode="pan", margin=dict(l=20, r=20, t=60, b=20), modebar_add=["drawline", "drawopenpath", "drawrect", "drawcircle", "eraseshape"], modebar_remove=["lasso2d", "select2d"])
+        fig.update_xaxes(rangeslider_visible=True, showspikes=True, spikemode="across", spikesnap="cursor")
         fig.update_yaxes(side="left", tickformat=".2f", row=1, col=1)
 
-        chart_file.parent.mkdir(parents=True, exist_ok=True)
-        fig.write_html(
-            str(chart_file),
-            include_plotlyjs="cdn",
-            config={"scrollZoom": True, "displaylogo": False, "doubleClick": "reset"},
-        )
-        return send_file(chart_file)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fig.write_html(str(out), include_plotlyjs="cdn", config={"scrollZoom": True, "displaylogo": False, "doubleClick": "reset"})
+        return send_file(out)
     except Exception as e:
-        append_live_log(f"图表生成失败 {symbol} {timeframe}: {e}")
-        return f"<html><body style='font-family:Arial'><h3>图表生成失败: {e}</h3></body></html>"
+        append_live_log(f"图表失败: {e}")
+        return f"<html><body><h3>图表生成失败: {e}</h3></body></html>"
 
 
 if __name__ == "__main__":
     try:
-        logger.info("Starting Flask server on 127.0.0.1:8501")
         app.run(host="127.0.0.1", port=8501)
     except Exception as exc:
-        logger.exception("Flask server crashed: %s", exc)
         append_live_log(f"UI启动失败: {exc}")
         with UI_DEBUG_LOG.open("a", encoding="utf-8") as f:
             f.write(traceback.format_exc() + "\n")

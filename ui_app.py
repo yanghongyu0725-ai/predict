@@ -259,33 +259,68 @@ def fetch_full_ohlcv(symbol: str, timeframe: str = "4h") -> tuple[pd.DataFrame, 
 
 def _apply_indicators(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
+    d["ema21"] = d["Close"].ewm(span=21, adjust=False).mean()
+    d["ema55"] = d["Close"].ewm(span=55, adjust=False).mean()
     d["ema89"] = d["Close"].ewm(span=89, adjust=False).mean()
     d["ema144"] = d["Close"].ewm(span=144, adjust=False).mean()
-    d["ema169"] = d["Close"].ewm(span=169, adjust=False).mean()
-    d["ema20"] = d["Close"].ewm(span=20, adjust=False).mean()
-    d["ema50"] = d["Close"].ewm(span=50, adjust=False).mean()
 
-    ema12 = d["Close"].ewm(span=12, adjust=False).mean(); ema26 = d["Close"].ewm(span=26, adjust=False).mean()
-    d["macd"] = ema12 - ema26; d["macd_signal"] = d["macd"].ewm(span=9, adjust=False).mean(); d["macd_hist"] = d["macd"] - d["macd_signal"]
+    ema12 = d["Close"].ewm(span=12, adjust=False).mean()
+    ema26 = d["Close"].ewm(span=26, adjust=False).mean()
+    d["macd"] = ema12 - ema26
+    d["macd_signal"] = d["macd"].ewm(span=9, adjust=False).mean()
+    d["macd_hist"] = d["macd"] - d["macd_signal"]
 
     tr = pd.concat([(d["High"] - d["Low"]), (d["High"] - d["Close"].shift(1)).abs(), (d["Low"] - d["Close"].shift(1)).abs()], axis=1).max(axis=1)
     d["atr14"] = tr.rolling(14).mean().bfill()
 
-    delta = d["Close"].diff(); gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean(); loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean().replace(0, 1e-9)
+    delta = d["Close"].diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean().replace(0, 1e-9)
     d["rsi14"] = 100 - 100 / (1 + gain / loss)
 
-    d["vol_sma20"] = d["Volume"].rolling(20).mean(); d["vol_ratio"] = d["Volume"] / d["vol_sma20"].replace(0, np.nan)
-    d["highest_20"] = d["High"].rolling(20).max(); d["lowest_20"] = d["Low"].rolling(20).min()
-    d["obv"] = (np.sign(d["Close"].diff().fillna(0)) * d["Volume"]).cumsum(); d["obv_ema20"] = d["obv"].ewm(span=20, adjust=False).mean()
+    d["vol_sma20"] = d["Volume"].rolling(20).mean()
+    d["vol_ratio"] = d["Volume"] / d["vol_sma20"].replace(0, np.nan)
+    d["highest_20"] = d["High"].rolling(20).max()
+    d["lowest_20"] = d["Low"].rolling(20).min()
+    d["obv"] = (np.sign(d["Close"].diff().fillna(0)) * d["Volume"]).cumsum()
+    d["obv_ema20"] = d["obv"].ewm(span=20, adjust=False).mean()
     return d
 
 
-def _ema_cross_signal(row: pd.Series, prev: pd.Series) -> int:
-    bull = prev["ema89"] <= prev["ema144"] and row["ema89"] > row["ema144"]
-    bear = prev["ema89"] >= prev["ema144"] and row["ema89"] < row["ema144"]
-    if bull and row["Close"] > row["ema89"] > row["ema144"] and row["Close"] > row["ema169"]:
+def _trend_state(row: pd.Series, prev: pd.Series) -> int:
+    up = (
+        row["Close"] > row["ema144"]
+        and row["ema55"] > row["ema89"] > row["ema144"]
+        and row["ema55"] > prev["ema55"]
+        and row["ema89"] > prev["ema89"]
+        and row["ema144"] > prev["ema144"]
+    )
+    down = (
+        row["Close"] < row["ema144"]
+        and row["ema55"] < row["ema89"] < row["ema144"]
+        and row["ema55"] < prev["ema55"]
+        and row["ema89"] < prev["ema89"]
+        and row["ema144"] < prev["ema144"]
+    )
+    return 1 if up else -1 if down else 0
+
+
+def _ema_channel_signal(row: pd.Series, prev: pd.Series) -> int:
+    trend = _trend_state(row, prev)
+    if trend == 0:
+        return 0
+
+    # 回踩55后确认回到21上/下（4h收盘）
+    touched_55_long = row["Low"] <= row["ema55"] * 1.002
+    touched_55_short = row["High"] >= row["ema55"] * 0.998
+    vol_shrink = row["Volume"] <= prev["Volume"] * 1.1
+
+    long_confirm = prev["Close"] <= prev["ema21"] and row["Close"] > row["ema21"]
+    short_confirm = prev["Close"] >= prev["ema21"] and row["Close"] < row["ema21"]
+
+    if trend == 1 and touched_55_long and long_confirm and vol_shrink:
         return 1
-    if bear and row["Close"] < row["ema89"] < row["ema144"] and row["Close"] < row["ema169"]:
+    if trend == -1 and touched_55_short and short_confirm and vol_shrink:
         return -1
     return 0
 
@@ -310,16 +345,16 @@ def _macd_divergence_points(df: pd.DataFrame, lookback: int = 60) -> Tuple[List[
 def build_signal_plan(df_4h_raw: pd.DataFrame) -> SignalPlan:
     d = _apply_indicators(df_4h_raw)
     row, prev = d.iloc[-2], d.iloc[-3]  # 已收盘4h
-    cross = _ema_cross_signal(row, prev)
+    cross = _ema_channel_signal(row, prev)
     bull_div, bear_div = _macd_divergence_points(d, lookback=60)
     idx = len(d) - 2
     div = -1 if idx in set(bear_div) else 1 if idx in set(bull_div) else 0
     entry = float(row["Close"])
     dist = max(float(row["atr14"]) * 1.2, entry * 0.004)
     if cross == 1:
-        return SignalPlan("做多", "EMA89上穿EMA144且站上EMA169(4h收盘确认)", str(row["ts"]), entry, entry - dist, entry + dist * 1.8)
+        return SignalPlan("做多", "EMA21/55/89/144 多头通道回踩55后重回21(4h确认)", str(row["ts"]), entry, entry - dist, entry + dist * 1.8)
     if cross == -1:
-        return SignalPlan("做空", "EMA89下穿EMA144且跌破EMA169(4h收盘确认)", str(row["ts"]), entry, entry + dist, entry - dist * 1.8)
+        return SignalPlan("做空", "EMA21/55/89/144 空头通道反弹55后跌回21(4h确认)", str(row["ts"]), entry, entry + dist, entry - dist * 1.8)
     if div == -1:
         return SignalPlan("止盈", "4h MACD顶背离", str(row["ts"]), entry, entry, entry)
     if div == 1:
@@ -445,10 +480,10 @@ def _recommend_leverage_and_margin(exposure: float) -> tuple[float, float]:
 
 def _strategy_signal_factory(name: str):
     def sig_ema(df, i, row, prev):
-        return _ema_cross_signal(row, prev)
+        return _ema_channel_signal(row, prev)
 
     def sig_confluence(df, i, row, prev):
-        ema_trend = 1 if row["ema20"] > row["ema50"] > row["ema89"] else -1 if row["ema20"] < row["ema50"] < row["ema89"] else 0
+        ema_trend = 1 if row["ema21"] > row["ema55"] > row["ema89"] else -1 if row["ema21"] < row["ema55"] < row["ema89"] else 0
         macd = 1 if row["macd_hist"] > 0 else -1 if row["macd_hist"] < 0 else 0
         rsi = 1 if row["rsi14"] > 55 else -1 if row["rsi14"] < 45 else 0
         vol = 1 if row["vol_ratio"] > 1.2 and row["obv"] > row["obv_ema20"] else -1 if row["vol_ratio"] > 1.2 and row["obv"] < row["obv_ema20"] else 0
@@ -468,7 +503,7 @@ def _strategy_signal_factory(name: str):
 def _profile_grid(profile: str):
     if profile == "deep":
         return [(s, h) for s in [0.9, 1.1, 1.3, 1.5, 1.8] for h in [24, 36, 48, 72, 96]]
-    return [(s, h) for s in [1.0, 1.2, 1.4] for h in [24, 48, 72]]
+    return [(s, h) for s in [0.9, 1.1, 1.3, 1.5] for h in [24, 36, 48, 72]]
 
 
 def _backtest_engine(df: pd.DataFrame, profile: str) -> dict:
@@ -624,9 +659,10 @@ def chart():
 
         fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.62, 0.20, 0.18], vertical_spacing=0.03)
         fig.add_trace(go.Candlestick(x=di["ts"], open=di["Open"], high=di["High"], low=di["Low"], close=di["Close"], name=f"{symbol} {tf}"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=di["ts"], y=di["ema89"], name="EMA89", line=dict(color="white", width=1.5)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=di["ts"], y=di["ema144"], name="EMA144", line=dict(color="yellow", width=1.5)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=di["ts"], y=di["ema169"], name="EMA169", line=dict(color="blue", width=1.5)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=di["ts"], y=di["ema21"], name="EMA21", line=dict(color="#ffffff", width=1.4)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=di["ts"], y=di["ema89"], name="EMA89", line=dict(color="#00b0ff", width=1.4)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=di["ts"], y=di["ema55"], name="EMA55", line=dict(color="rgba(255,193,7,0.8)", width=0.8)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=di["ts"], y=di["ema144"], name="EMA144", line=dict(color="rgba(255,152,0,0.8)", width=0.8), fill="tonexty", fillcolor="rgba(255,193,7,0.18)"), row=1, col=1)
         fig.add_trace(go.Bar(x=di["ts"], y=di["Volume"], name="VOL", marker_color="#888"), row=2, col=1)
         fig.add_trace(go.Scatter(x=di["ts"], y=di["macd"], name="MACD", line=dict(color="#00bcd4", width=1.2)), row=3, col=1)
         fig.add_trace(go.Scatter(x=di["ts"], y=di["macd_signal"], name="MACD_SIGNAL", line=dict(color="#ff9800", width=1.0)), row=3, col=1)

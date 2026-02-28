@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal EnableDelayedExpansion
 chcp 65001 >nul
 set PYTHONUTF8=1
 set PYTHONIOENCODING=utf-8
@@ -17,6 +17,7 @@ if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
 echo ==================================================>"%DEPLOY_LOG%"
 echo [%date% %time%] one_click_deploy start >>"%DEPLOY_LOG%"
 echo UI_URL=%UI_URL% >>"%DEPLOY_LOG%"
+if exist "%UI_LOG%" del /q "%UI_LOG%"
 
 echo [INFO] Deploy log: %DEPLOY_LOG%
 echo [INFO] UI log: %UI_LOG%
@@ -100,15 +101,17 @@ if not "%RC%"=="0" goto :fail_ui_check
 
 echo [STEP] 4/5 Start UI process...
 echo [%date% %time%] STEP4 start ui process begin >>"%DEPLOY_LOG%"
-start "Strategy UI Server" "%VENV_PYTHON%" ui_app.py
+start "Strategy UI Server" /b "%VENV_PYTHON%" -u ui_app.py 1>>"%UI_LOG%" 2>&1
 set "RC=%ERRORLEVEL%"
 echo [%date% %time%] STEP4 start rc=%RC% >>"%DEPLOY_LOG%"
 if not "%RC%"=="0" goto :fail_ui_check
+timeout /t 2 >nul
 
 echo [STEP] 5/5 Check UI health and open browser...
 echo [%date% %time%] STEP5 healthcheck begin >>"%DEPLOY_LOG%"
 for /l %%i in (1,1,20) do (
-  echo [%date% %time%] healthcheck try %%i >>"%DEPLOY_LOG%"
+  echo [!date! !time!] healthcheck try %%i >>"%DEPLOY_LOG%"
+  netstat -ano | findstr :%UI_PORT% >>"%DEPLOY_LOG%" 2>&1
   powershell -NoProfile -Command "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; try { $r=Invoke-WebRequest -UseBasicParsing -Uri '%UI_URL%' -TimeoutSec 2; if($r.StatusCode -ge 200){ exit 0 } else { exit 1 } } catch { exit 1 }"
   if not errorlevel 1 (
     start "Strategy UI" %UI_URL%
@@ -124,6 +127,7 @@ echo [WARN] %UI_LOG%
 echo [WARN] %DEPLOY_LOG%
 echo [TIP] Run diagnose_ui.bat for one-click diagnostics.
 echo [%date% %time%] WARN ui not ready in timeout window >>"%DEPLOY_LOG%"
+if exist "%UI_LOG%" powershell -NoProfile -Command "Get-Content -Encoding UTF8 -Tail 120 '%UI_LOG%'" >>"%DEPLOY_LOG%" 2>&1
 tasklist | findstr /I "python.exe" >>"%DEPLOY_LOG%" 2>&1
 if exist "%UI_LOG%" (
   echo -------- ui_server.log tail 60 --------
